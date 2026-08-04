@@ -1,10 +1,8 @@
 """Reading users, held-out items and histories out of a loaded checkpoint.
 
 These helpers touch the dataset rather than the model's channels, so they live
-apart from the attribution itself. Keeping them here is what lets a measurement
-script depend on the package alone: before, ``run_discrimination`` had to import
-the 370-line report generator in ``explain_dgcdr`` to get two ten-line
-functions.
+apart from the attribution itself, and keeping them here is what lets a
+measurement script depend on the package alone.
 """
 
 import random
