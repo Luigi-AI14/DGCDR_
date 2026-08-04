@@ -1,8 +1,7 @@
 """Exact channel attribution for DGCDR recommendations.
 
 Decomposes each recommendation into the model's own disentangled channels
-(domain-shared vs domain-specific), reports the transfer ratio tau, and
-optionally verbalises the result with an LLM constrained by those numbers.
+(domain-shared vs domain-specific) and reports the transfer ratio tau.
 
 The decomposition is exact by construction, and the run verifies it: the
 channels are summed back and checked against ``model.forward()`` before any
@@ -11,16 +10,13 @@ explanation is produced.
 Examples:
     python explain_dgcdr.py -m saved/DGCDR-Jul-14-2026_12-22-57.pth
     python explain_dgcdr.py -m saved/model.pth --num_users 50 --topk 5 \
-        --metadata item_metadata/meta_CDs_and_Vinyl.jsonl \
-        --llm_model qwen2.5:7b
+        --metadata item_metadata/meta_CDs_and_Vinyl.jsonl
 """
 
 import argparse
 import glob
 import json
 import os
-import random
-from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
@@ -33,6 +29,11 @@ from extensions.explainability.attribution import (
     pooled_transfer_ratio,
     reliable_attributions,
 )
+from extensions.explainability.data import (
+    build_ground_truth,
+    select_users,
+    source_history,
+)
 from extensions.explainability.channels import (
     SHARED,
     SPECIFIC,
@@ -40,7 +41,6 @@ from extensions.explainability.channels import (
     verify_decomposition,
 )
 from extensions.explainability.metadata import load_catalogue
-from extensions.explainability.verbalize import LLMClient, build_prompt, source_history
 
 DEFAULT_MODEL_PATH = "saved/DGCDR-Jul-14-2026_12-22-57.pth"
 
@@ -51,31 +51,6 @@ def get_latest_checkpoint(checkpoint_dir='saved'):
         return None
     pth_files.sort(key=os.path.getmtime, reverse=True)
     return pth_files[0]
-
-
-def build_ground_truth(test_data):
-    """user id -> list of held-out target-domain item ids."""
-    ground_truth = defaultdict(list)
-    try:
-        dataset = test_data.dataset
-        uid_field, iid_field = dataset.uid_field, dataset.iid_field
-        users = dataset.inter_feat[uid_field].numpy()
-        items = dataset.inter_feat[iid_field].numpy()
-        for u, i in zip(users, items):
-            ground_truth[int(u)].append(int(i))
-    except (AttributeError, KeyError) as exc:
-        print(f"[warn] could not read test interactions ({exc}); "
-              f"explanations will have no ground truth.")
-    return ground_truth
-
-
-def select_users(model, num_users, seed=42):
-    """Sample overlapping users -- the only ones with a defined transfer ratio."""
-    candidates = list(range(1, model.overlapped_num_users))  # skip [PAD]
-    if num_users and num_users < len(candidates):
-        random.Random(seed).shuffle(candidates)
-        candidates = sorted(candidates[:num_users])
-    return candidates
 
 
 def summarise(explanations, min_magnitude_ratio=0.1):
@@ -262,9 +237,6 @@ def write_markdown(path, explanations, summary, verification, catalogue):
                 f"{a.dominant_channel} |"
             )
         lines.append("")
-        for a in explanation.attributions:
-            if getattr(a, 'text', None):
-                lines += [f"> **#{a.rank}** {a.text}", ""]
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write("\n".join(lines))
@@ -290,14 +262,6 @@ def main():
     parser.add_argument('--metadata_id_field', default='parent_asin')
     parser.add_argument('--metadata_cache', default=None,
                         help="Cached, filtered catalogue; built from --metadata if absent")
-    parser.add_argument('--llm_model', type=str, default=None,
-                        help="Model name for verbalisation; omit to skip the LLM stage")
-    parser.add_argument('--llm_base_url', type=str, default=None,
-                        help="OpenAI-compatible endpoint (default: env or localhost Ollama)")
-    parser.add_argument('--llm_max_users', type=int, default=10,
-                        help="Verbalise only the first N users, to bound LLM cost")
-    parser.add_argument('--llm_max_items', type=int, default=3,
-                        help="Verbalise only the top N items per user")
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -359,24 +323,6 @@ def main():
 
     summary = summarise(explanations, args.tau_min_magnitude_ratio)
 
-    if args.llm_model:
-        print(f"Verbalising with {args.llm_model}...")
-        client = LLMClient(args.llm_model, base_url=args.llm_base_url)
-        source_name = config['source_domain']['dataset']
-        target_name = config['target_domain']['dataset']
-        for explanation in explanations[:args.llm_max_users]:
-            src_hist = source_history(model, explanation.user_id, limit=20)
-            for attribution in explanation.attributions[:args.llm_max_items]:
-                prompt = build_prompt(
-                    attribution, catalogue, explanation.history, src_hist,
-                    source_domain_name=source_name, target_domain_name=target_name)
-                try:
-                    attribution.text = client.generate(prompt)
-                except RuntimeError as exc:
-                    print(f"  [warn] {exc}")
-                    attribution.text = None
-                    break
-
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     stem = f"attribution_{os.path.basename(model_path).replace('.pth', '')}_{timestamp}"
 
@@ -390,13 +336,7 @@ def main():
             'attention_mode': model.attention_mode,
             'verification': verification,
             'summary': summary,
-            'explanations': [
-                dict(e.to_dict(),
-                     recommendations=[
-                         dict(a.to_dict(), text=getattr(a, 'text', None))
-                         for a in e.attributions])
-                for e in explanations
-            ],
+            'explanations': [e.to_dict() for e in explanations],
         }, f, indent=2)
 
     md_path = os.path.join(args.output_dir, f"{stem}.md")

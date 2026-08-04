@@ -24,7 +24,7 @@ from extensions.explainability.channels import (
     verify_decomposition,
 )
 from extensions.explainability.counterfactual import counterfactual_for_user, summarise
-from explain_dgcdr import build_ground_truth, select_users
+from extensions.explainability.data import build_ground_truth, select_users
 
 
 def main():
