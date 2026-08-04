@@ -77,14 +77,13 @@ class UserExplanation:
     """All attributions for one user's recommendation list."""
 
     def __init__(self, user_id, user_token, attributions, is_overlapping,
-                 ground_truth=None, history=None, source_history=None):
+                 ground_truth=None, history=None):
         self.user_id = user_id
         self.user_token = user_token
         self.attributions = attributions
         self.is_overlapping = is_overlapping
         self.ground_truth = ground_truth or []
         self.history = history or []
-        self.source_history = source_history or []
 
     @property
     def mean_tau(self):
@@ -105,7 +104,6 @@ class UserExplanation:
             'n_hits': self.n_hits,
             'ground_truth_items': self.ground_truth,
             'history_items': self.history,
-            'source_history_items': self.source_history,
             'recommendations': [a.to_dict() for a in self.attributions],
         }
 
@@ -151,24 +149,6 @@ def pooled_transfer_ratio(attributions):
     numerator = sum(abs(a.user_channel_totals.get(SHARED, 0.0)) for a in attributions)
     denominator = sum(a.magnitude for a in attributions)
     return numerator / denominator if denominator > 0 else 0.0
-
-
-def reliable_attributions(attributions, min_magnitude_ratio=0.1):
-    """Drop attributions whose tau is dominated by numerical noise.
-
-    tau is a ratio of signed sums: when ``magnitude`` approaches zero the two
-    channels nearly cancel and tau swings across the whole [0, 1] range without
-    meaning anything.  On a real catalogue this affects low-scoring items, so
-    tau statistics must be reported over the items that carry actual
-    contribution mass.  The threshold is relative to the median magnitude of
-    the set, so it adapts to the scale of the checkpoint.
-    """
-    if not attributions:
-        return [], 0.0
-    magnitudes = sorted(a.magnitude for a in attributions)
-    median = magnitudes[len(magnitudes) // 2]
-    threshold = median * min_magnitude_ratio
-    return [a for a in attributions if a.magnitude >= threshold], threshold
 
 
 def attribute_scores(decomposition, user_id, item_ids):
@@ -248,7 +228,7 @@ def recommend(model, decomposition, user_id, topk=10, mask_history=True):
 
 
 def explain_user(model, decomposition, user_id, topk=10, mask_history=True,
-                 user_token=None, ground_truth=None, source_history=None):
+                 user_token=None, ground_truth=None):
     """Produce the full attributed recommendation list for one user."""
     item_ids, history = recommend(model, decomposition, user_id, topk, mask_history)
     attributions = attribute_scores(decomposition, user_id, item_ids)
@@ -265,5 +245,4 @@ def explain_user(model, decomposition, user_id, topk=10, mask_history=True,
         is_overlapping=bool(decomposition.overlap_mask[user_id].item()),
         ground_truth=ground_truth,
         history=history,
-        source_history=source_history,
     )

@@ -23,7 +23,11 @@ from extensions.explainability.channels import (
     decompose_target_domain,
     verify_decomposition,
 )
-from extensions.explainability.counterfactual import counterfactual_for_user, summarise
+from extensions.explainability.counterfactual import (
+    counterfactual_for_user,
+    prepare,
+    summarise,
+)
 from extensions.explainability.data import build_ground_truth, select_users
 
 
@@ -60,8 +64,9 @@ def main():
         for attribution in explanation.attributions:
             taus[(user_id, attribution.item_id)] = attribution.tau
 
-    results = [counterfactual_for_user(model, decomposition, u, args.topk,
-                                       set(args.drop), ground_truth.get(u, []))
+    embeddings = prepare(decomposition, set(args.drop))
+    results = [counterfactual_for_user(model, embeddings, u, args.topk,
+                                       ground_truth.get(u, []))
                for u in users]
     summary = summarise(results, taus)
 

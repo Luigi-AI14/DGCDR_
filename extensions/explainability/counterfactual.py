@@ -25,6 +25,13 @@ def ablated_user_embeddings(decomposition, drop):
     return sum(v for k, v in decomposition.user_channels.items() if k not in drop)
 
 
+def prepare(decomposition, drop):
+    """The three embedding tables an ablation compares, built once."""
+    return {'item': decomposition.fused_item_embeddings(),
+            'user_full': decomposition.fused_user_embeddings(),
+            'user_ablated': ablated_user_embeddings(decomposition, drop)}
+
+
 def _scores(user_emb, item_emb, user_id, history, n_items):
     scores = torch.matmul(item_emb[:n_items], user_emb[user_id])
     if history:
@@ -33,22 +40,23 @@ def _scores(user_emb, item_emb, user_id, history, n_items):
     return scores
 
 
-def counterfactual_for_user(model, decomposition, user_id, topk, drop,
-                            ground_truth=None):
+def counterfactual_for_user(model, embeddings, user_id, topk, ground_truth=None):
     """Re-rank one user with and without a channel.
+
+    ``embeddings`` comes from :func:`prepare`: the fused tables are the same for
+    every user, so they are built once instead of once per user.
 
     Returns a dict with the original top-k, which of them survive in the new
     top-k, their new ranks, and hits before and after.
     """
     n_items = model.target_num_items
-    item_emb = decomposition.fused_item_embeddings()
+    item_emb = embeddings['item']
 
     inter = model.target_interaction_matrix
     history = [int(i) for i in inter.col[inter.row == user_id] if int(i) < n_items]
 
-    full = _scores(decomposition.fused_user_embeddings(), item_emb, user_id, history, n_items)
-    ablated = _scores(ablated_user_embeddings(decomposition, drop), item_emb,
-                      user_id, history, n_items)
+    full = _scores(embeddings['user_full'], item_emb, user_id, history, n_items)
+    ablated = _scores(embeddings['user_ablated'], item_emb, user_id, history, n_items)
 
     top_full = torch.topk(full, k=min(topk, n_items - 1)).indices
     top_ablated = torch.topk(ablated, k=min(topk, n_items - 1)).indices

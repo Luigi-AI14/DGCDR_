@@ -37,14 +37,3 @@ def select_users(model, num_users, seed=42):
         random.Random(seed).shuffle(candidates)
         candidates = sorted(candidates[:num_users])
     return candidates
-
-
-def source_history(model, user_id, limit=None):
-    """The user's interactions in the *source* domain.
-
-    Target- and source-domain user ids share one id space, so the same index
-    reads both.
-    """
-    inter = model.source_interaction_matrix
-    items = [int(i) for i in inter.col[inter.row == user_id]]
-    return items[:limit] if limit else items
