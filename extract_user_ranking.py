@@ -22,7 +22,7 @@ def main():
     first_batch = next(iter(test_data))
     if isinstance(first_batch, tuple):
         # FullSortEvalDataLoader yields (interaction, history_index, positive_u, positive_i)
-        interaction, _, positive_u, positive_i = first_batch
+        interaction, history_index, positive_u, positive_i = first_batch
         user_interaction = interaction[0:1].to(config['device'])
         # Extract ground truth items for the first user
         target_uid = interaction['target_user_id'][0] if 'target_user_id' in interaction else interaction['user_id'][0]
@@ -41,25 +41,43 @@ def main():
     # Exclude padding item (0)
     scores[0] = -np.inf
     
+    # Retrieve the item ID map from the target dataset early for masking
+    target_ds = dataset.target_domain_dataset
+    target_uid_field = target_ds.uid_field
+    target_iid_field = target_ds.iid_field
+    
+    # Extract Target Domain History
+    target_inter_file = 'dataset/AmazonInstruments_AmazonCDs_commonUser_3-core/AmazonInstruments_AmazonCDs_commonUser_3-core.inter'
+    target_item_ids = []
+    with open(target_inter_file, 'r', encoding='utf-8') as f:
+        next(f) # Skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 2 and parts[0] == target_ds.field2id_token[target_uid_field][target_uid]:
+                target_item_ids.append(parts[1])
+
+    # Manually mask target domain history (excluding the test ground truth)
+    for ext_id in target_item_ids:
+        try:
+            internal_idx = target_ds.token2id(target_iid_field, ext_id)
+            if internal_idx not in user_pos_items:
+                scores[internal_idx] = -np.inf
+        except ValueError:
+            pass
+
     # Get top 20 items
     topk_scores, topk_indices = torch.topk(scores, 20)
     topk_indices = topk_indices.cpu().numpy()
+
+    # Map back to external ASIN tokens
+    external_item_ids = [target_ds.field2id_token[target_iid_field][idx] for idx in topk_indices]
+    user_pos_items_mapped = [target_ds.field2id_token[target_iid_field][idx] for idx in user_pos_items]
+    ids_to_find = set(external_item_ids + user_pos_items_mapped + target_item_ids)
     
-    # Retrieve the item ID map from the target dataset
-    target_dataset = dataset.target_domain_dataset
-    iid_field = target_dataset.iid_field
-    id_map = target_dataset.field2id_token[iid_field]
-    
-    # Map internal indices back to external tokens (parent_asin)
-    external_item_ids = [id_map[idx] for idx in topk_indices]
-    
-    metadata_file = 'item_metadata/meta_Musical_Instruments.jsonl'
-    
-    ids_to_find = set(external_item_ids)
+    # Read item metadata line by line
     item_metadata = {}
-    
-    print(f"Scanning {metadata_file} for titles...")
-    with open(metadata_file, 'r', encoding='utf-8') as f:
+    print(f"Scanning item_metadata/meta_Musical_Instruments.jsonl for titles...")
+    with open('item_metadata/meta_Musical_Instruments.jsonl', 'r', encoding='utf-8') as f:
         for line in f:
             data = json.loads(line)
             asin = data.get('parent_asin', '')
@@ -79,9 +97,12 @@ def main():
     mrr_val = MRR(config).metric_info(pos_index_np)[0, -1].item()
     ndcg_val = NDCG(config).metric_info(pos_index_np, pos_len_np)[0, -1].item()
 
+    external_uid = target_ds.field2id_token[target_uid_field][target_uid]
+
     output_lines = []
     output_lines.append("=" * 90)
-    output_lines.append(f"{'RANKING FOR USER 1':^90}")
+    title_str = f"RANKING FOR USER {external_uid}"
+    output_lines.append(f"{title_str:^90}")
     output_lines.append("=" * 90)
     output_lines.append(f" {'Rank':<4} | {'Relevant':<8} | {'Item ID':<10} | {'Title':<50}")
     output_lines.append("-" * 90)
@@ -102,9 +123,6 @@ def main():
     output_lines.append("=" * 90)
     
     # === Extract Source Domain History ===
-    target_ds = dataset.target_domain_dataset
-    target_uid_field = target_ds.uid_field
-    external_uid = target_ds.field2id_token[target_uid_field][target_uid]
     
     source_inter_file = 'dataset/AmazonCDs_AmazonInstruments_commonUser_3-core/AmazonCDs_AmazonInstruments_commonUser_3-core.inter'
     source_item_ids = []
@@ -142,6 +160,19 @@ def main():
             title = title[:66] + "..."
         output_lines.append(f" {item_id:<12} | {title:<72}")
     
+    # === Extract Target Domain History ===
+    output_lines.append("==========================================================================================")
+    output_lines.append(f"{'TARGET DOMAIN HISTORY (AmazonInstruments)':^90}")
+    output_lines.append("==========================================================================================")
+    output_lines.append(f" {'Item ID':<12} | {'Title':<72}")
+    output_lines.append("-" * 90)
+    
+    for item_id in target_item_ids:
+        title = item_metadata.get(item_id, 'Unknown Title')
+        if len(title) > 69:
+            title = title[:66] + "..."
+        output_lines.append(f" {item_id:<12} | {title:<72}")
+        
     output_lines.append("==========================================================================================")
     
     final_output = "\n".join(output_lines)
