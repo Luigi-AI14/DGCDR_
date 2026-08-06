@@ -1,6 +1,23 @@
+# IDE and OS specific files
 .idea/
+.vscode/
 .DS_Store
 **/.DS_Store
 .DS_Store?
-*.pyc
-*.inter
+
+# Cache and compiled Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Generated data
+
+# Logs, checkpoints, and outputs
+saved/
+log/
+log_tensorboard/
+discrimination_out/
+
+# Specific local files to ignore
+test_recbole_metrics.py
