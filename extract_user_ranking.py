@@ -10,9 +10,9 @@ np.bool = bool
 from recbole.evaluator.metrics import Hit, Recall, NDCG, MRR
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
-MODEL_PATH = 'saved/DGCDR-Aug-06-2026_17-41-44.pth'
-TARGET_META_FILE = 'meta_Musical_Instruments.jsonl/meta_Musical_Instruments.jsonl'
-SOURCE_META_FILE = 'meta_CDs_and_Vinyl.jsonl/meta_CDs_and_Vinyl.jsonl'
+MODEL_PATH = 'saved/DGCDR-Aug-06-2026_11-46-49-CDs_Instruments-42.pth'
+TARGET_META_FILE = 'item_metadata/meta_Musical_Instruments.jsonl'
+SOURCE_META_FILE = 'item_metadata/meta_CDs_and_Vinyl.jsonl'
 TOPK = 20
 
 # This model is evaluated with repeatable=True, so the sampler hands the loader an
@@ -68,7 +68,8 @@ def user_metrics(ranked_ids, positives, config):
 
 
 def truncate(title, width):
-    return title if len(title) <= width else title[:width - 3] + "..."
+    # Titles are no longer truncated for markdown tables
+    return title
 
 
 def main():
@@ -128,67 +129,63 @@ def main():
     native = user_metrics(recbole_indices, user_pos_items, config)
 
     output_lines = []
-    output_lines.append("=" * 90)
     title_str = f"RANKING FOR USER {external_uid} (internal id {target_uid})"
-    output_lines.append(f"{title_str:^90}")
-    output_lines.append("=" * 90)
-    output_lines.append(f" {'Rank':<4} | {'Relevant':<8} | {'Item ID':<10} | {'Title':<50}")
-    output_lines.append("-" * 90)
+    output_lines.append(f"## {title_str}\n")
+    output_lines.append("| Rank | Relevant | Item ID | Title |")
+    output_lines.append("|---|---|---|---|")
 
     for i, ext_id in enumerate(external_item_ids, 1):
         title = truncate(item_metadata.get(ext_id, 'Unknown Title'), 47)
         rel_str = "Yes" if int(topk_indices[i - 1]) in user_pos_items else "No"
-        output_lines.append(f" {i:<4} | {rel_str:<8} | {ext_id:<10} | {title:<50}")
+        output_lines.append(f"| {i} | {rel_str} | {ext_id} | {title} |")
 
-    output_lines.append("=" * 90)
-    output_lines.append(f"User Metrics (@{TOPK}), over {len(user_pos_items)} held-out items:")
+    output_lines.append("\n<br>\n")
+    output_lines.append(f"**User Metrics (@{TOPK}), over {len(user_pos_items)} held-out items:**\n")
     if HIDE_SEEN_ITEMS:
-        output_lines.append(" ranking above, already-seen items hidden:")
-        output_lines.append(f" - Hit Ratio: {shown['hit']:.4f}   Recall: {shown['recall']:.4f}   "
-                            f"MRR: {shown['mrr']:.4f}   NDCG: {shown['ndcg']:.4f}")
-        output_lines.append(" RecBole protocol (repeatable=True, nothing masked):")
-    output_lines.append(f" - Hit Ratio: {native['hit']:.4f}   Recall: {native['recall']:.4f}   "
-                        f"MRR: {native['mrr']:.4f}   NDCG: {native['ndcg']:.4f}")
-    output_lines.append("=" * 90)
-
+        output_lines.append("> **ranking above, already-seen items hidden:**")
+        output_lines.append(f"> Hit Ratio: {shown['hit']:.4f} &nbsp;|&nbsp; Recall: {shown['recall']:.4f} &nbsp;|&nbsp; MRR: {shown['mrr']:.4f} &nbsp;|&nbsp; NDCG: {shown['ndcg']:.4f}")
+        output_lines.append("> ")
+        output_lines.append("> **RecBole protocol (repeatable=True, nothing masked):**")
+    else:
+        output_lines.append("> **RecBole protocol (repeatable=True, nothing masked):**")
+        
+    output_lines.append(f"> Hit Ratio: {native['hit']:.4f} &nbsp;|&nbsp; Recall: {native['recall']:.4f} &nbsp;|&nbsp; MRR: {native['mrr']:.4f} &nbsp;|&nbsp; NDCG: {native['ndcg']:.4f}")
+    output_lines.append("\n<br>\n")
+    output_lines.append("---\n")
+    
     # === Held-out target items (the test ground truth) ===
-    output_lines.append(f"{'HELD-OUT TARGET ITEMS (test ground truth)':^90}")
-    output_lines.append("=" * 90)
-    output_lines.append(f" {'Item ID':<12} | {'Title':<72}")
-    output_lines.append("-" * 90)
+    output_lines.append("## HELD-OUT TARGET ITEMS (test ground truth)\n")
+    output_lines.append("| Item ID | Title |")
+    output_lines.append("|---|---|")
     for ext_id in ground_truth_ids:
-        output_lines.append(f" {ext_id:<12} | {truncate(item_metadata.get(ext_id, 'Unknown Title'), 72):<72}")
+        output_lines.append(f"| {ext_id} | {truncate(item_metadata.get(ext_id, 'Unknown Title'), 72)} |")
 
     # === Source Domain History ===
     source_items = items_of_user(source_ds, source_uid_field, source_iid_field, target_uid)
     source_item_ids = [source_iid_to_token[i] for i in source_items]
     source_item_metadata = load_titles(SOURCE_META_FILE, set(source_item_ids))
 
-    output_lines.append("=" * 90)
-    output_lines.append(f"{'SOURCE DOMAIN HISTORY (AmazonCDs)':^90}")
-    output_lines.append("=" * 90)
-    output_lines.append(f" {'Item ID':<12} | {'Title':<72}")
-    output_lines.append("-" * 90)
+    output_lines.append("\n<br>\n")
+    output_lines.append("## SOURCE DOMAIN HISTORY (AmazonCDs)\n")
+    output_lines.append("| Item ID | Title |")
+    output_lines.append("|---|---|")
     for item_id in source_item_ids:
-        output_lines.append(f" {item_id:<12} | {truncate(source_item_metadata.get(item_id, 'Unknown Title'), 72):<72}")
+        output_lines.append(f"| {item_id} | {truncate(source_item_metadata.get(item_id, 'Unknown Title'), 72)} |")
 
     # === Target Domain History (train + valid, i.e. what the model was fitted on) ===
-    output_lines.append("=" * 90)
-    output_lines.append(f"{'TARGET DOMAIN HISTORY (AmazonInstruments, train + valid)':^90}")
-    output_lines.append("=" * 90)
-    output_lines.append(f" {'Item ID':<12} | {'Title':<72}")
-    output_lines.append("-" * 90)
+    output_lines.append("\n<br>\n")
+    output_lines.append("## TARGET DOMAIN HISTORY (AmazonInstruments, train + valid)\n")
+    output_lines.append("| Item ID | Title |")
+    output_lines.append("|---|---|")
     for item_id in seen_item_ids:
-        output_lines.append(f" {item_id:<12} | {truncate(item_metadata.get(item_id, 'Unknown Title'), 72):<72}")
-
-    output_lines.append("=" * 90)
+        output_lines.append(f"| {item_id} | {truncate(item_metadata.get(item_id, 'Unknown Title'), 72)} |")
 
     final_output = "\n".join(output_lines)
     print("\n" + final_output)
 
     log_dir = "ranking_logs"
     os.makedirs(log_dir, exist_ok=True)
-    log_file_path = os.path.join(log_dir, "user_ranking_output.txt")
+    log_file_path = os.path.join(log_dir, "user_ranking_output.md")
 
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(final_output)
