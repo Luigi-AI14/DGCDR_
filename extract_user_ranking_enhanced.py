@@ -11,6 +11,8 @@ np.bool = bool
 from recbole.evaluator.metrics import Hit, Recall, NDCG, MRR
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
+from ranking_payload import domain_names, user_json
+
 MODEL_PATH = 'saved/DGCDR-Aug-06-2026_17-41-44.pth'
 TARGET_META_FILE = 'meta_Musical_Instruments.jsonl'
 SOURCE_META_FILE = 'meta_CDs_and_Vinyl.jsonl'
@@ -206,7 +208,9 @@ def main():
                     if item_id not in user_pos_items:
                         shown_scores[item_id] = -np.inf
 
-            topk_indices = torch.topk(shown_scores, TOPK)[1].cpu().numpy()
+            topk_values, topk_indices = torch.topk(shown_scores, TOPK)
+            topk_indices = topk_indices.cpu().numpy()
+            topk_values = topk_values.cpu().numpy()
             recbole_indices = torch.topk(scores, TOPK)[1].cpu().numpy()
 
             source_items = items_of_user(source_ds, source_uid_field, source_iid_field, target_uid)
@@ -216,6 +220,7 @@ def main():
                 'external_uid': external_uid,
                 'n_positives': len(user_pos_items),
                 'ranked_ids': [target_iid_to_token[int(i)] for i in topk_indices],
+                'ranked_scores': [float(s) for s in topk_values],
                 'ranked_relevant': [int(i) in user_pos_items for i in topk_indices],
                 'ground_truth_ids': [target_iid_to_token[int(i)] for i in user_pos_items],
                 'seen_item_ids': [target_iid_to_token[i] for i in seen_items],
@@ -246,6 +251,7 @@ def main():
     os.makedirs(users_dir, exist_ok=True)
 
     metric_key = 'shown' if HIDE_SEEN_ITEMS else 'native'
+    domains = domain_names(config, SOURCE_META_FILE, TARGET_META_FILE)
     aggregate = {'hit': 0.0, 'recall': 0.0, 'mrr': 0.0, 'ndcg': 0.0}
     summaries = []
     for record in records:
@@ -254,13 +260,19 @@ def main():
             aggregate[key] += metrics[key]
 
         user_file = f"user_{record['external_uid']}.md"
+        json_file = f"user_{record['external_uid']}.json"
         summaries.append({'external_uid': record['external_uid'],
                           'target_uid': record['target_uid'],
                           'hit': metrics['hit'], 'ndcg': metrics['ndcg'],
-                          'file': user_file})
+                          'file': user_file, 'json_file': json_file})
 
         with open(os.path.join(users_dir, user_file), "w", encoding="utf-8") as f:
             f.write(render_user(record, item_titles, source_titles))
+
+        with open(os.path.join(users_dir, json_file), "w", encoding="utf-8") as f:
+            json.dump(user_json(record, item_titles, source_titles, domains,
+                                TOPK, HIDE_SEEN_ITEMS),
+                      f, indent=2, ensure_ascii=False)
 
     for key in aggregate:
         aggregate[key] /= len(records)
@@ -288,7 +300,25 @@ def main():
     with open(summary_file_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
-    print(f"\nSaved analysis summary to {summary_file_path} and individual user reports to {users_dir}/")
+    summary_json_path = os.path.join(log_dir, "analysis_summary.json")
+    with open(summary_json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            'run': {
+                'model_path': MODEL_PATH,
+                'topk': TOPK,
+                'hide_seen_items': HIDE_SEEN_ITEMS,
+                'seed': SEED,
+                'n_users': len(records),
+                'metric_protocol': protocol,
+                'source_domain': domains['source'],
+                'target_domain': domains['target'],
+            },
+            'aggregate_metrics': aggregate,
+            'users': summaries,
+        }, f, indent=2, ensure_ascii=False)
+
+    print(f"\nSaved analysis summary to {summary_file_path} / {summary_json_path} "
+          f"and individual user reports to {users_dir}/")
 
 
 if __name__ == '__main__':

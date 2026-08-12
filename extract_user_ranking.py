@@ -10,6 +10,8 @@ np.bool = bool
 from recbole.evaluator.metrics import Hit, Recall, NDCG, MRR
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
+from ranking_payload import domain_names, user_json
+
 MODEL_PATH = 'saved/DGCDR-Aug-06-2026_17-41-44.pth'
 TARGET_META_FILE = 'meta_Musical_Instruments.jsonl'
 SOURCE_META_FILE = 'meta_CDs_and_Vinyl.jsonl'
@@ -133,7 +135,9 @@ def main():
             if item_id not in user_pos_items:
                 shown_scores[item_id] = -np.inf
 
-    topk_indices = torch.topk(shown_scores, TOPK)[1].cpu().numpy()
+    topk_values, topk_indices = torch.topk(shown_scores, TOPK)
+    topk_indices = topk_indices.cpu().numpy()
+    topk_values = topk_values.cpu().numpy()
     recbole_indices = torch.topk(scores, TOPK)[1].cpu().numpy()
 
     external_item_ids = [target_iid_to_token[int(i)] for i in topk_indices]
@@ -209,7 +213,28 @@ def main():
     with open(log_file_path, "w", encoding="utf-8") as f:
         f.write(final_output)
 
-    print(f"\nSaved formatted ranking to {log_file_path}")
+    # Same content as data, for run_llm_relevance.py.
+    record = {
+        'target_uid': target_uid,
+        'external_uid': external_uid,
+        'n_positives': len(user_pos_items),
+        'ranked_ids': external_item_ids,
+        'ranked_scores': [float(s) for s in topk_values],
+        'ranked_relevant': [int(i) in user_pos_items for i in topk_indices],
+        'ground_truth_ids': ground_truth_ids,
+        'seen_item_ids': seen_item_ids,
+        'source_item_ids': source_item_ids,
+        'shown': shown,
+        'native': native,
+    }
+    domains = domain_names(config, SOURCE_META_FILE, TARGET_META_FILE)
+    json_file_path = os.path.join(log_dir, "user_ranking_output.json")
+    with open(json_file_path, "w", encoding="utf-8") as f:
+        json.dump(user_json(record, item_metadata, source_item_metadata, domains,
+                            TOPK, HIDE_SEEN_ITEMS),
+                  f, indent=2, ensure_ascii=False)
+
+    print(f"\nSaved formatted ranking to {log_file_path} and {json_file_path}")
 
 
 if __name__ == '__main__':
