@@ -17,6 +17,14 @@ import json
 import os
 from datetime import datetime
 
+import numpy as np
+# RecBole 1.0.1 still uses np.float/np.int/np.bool, removed in numpy>=1.24.
+# CDRConfig patches them in its constructor, but load_data_and_model unpickles
+# the config instead of constructing one, so the patch has to happen here.
+np.float = float
+np.int = int
+np.bool = bool
+
 import torch
 
 from recbole_cdr.quick_start.quick_start import load_data_and_model
@@ -28,6 +36,11 @@ from extensions.explainability.channels import (
 )
 from extensions.explainability.discrimination import analyse_user, summarise
 from extensions.explainability.data import build_ground_truth, select_users
+
+
+def _fmt(value, width, places=4):
+    """Right-aligned number, or a dash when the metric was not computed."""
+    return f"{value:>{width}.{places}f}" if value is not None else f"{'-':>{width}}"
 
 
 def main():
@@ -65,6 +78,8 @@ def main():
             results.append(outcome)
 
     summary = summarise(results, args.topk)
+    if not summary:
+        raise RuntimeError("Nessun utente utilizzabile: tutti senza item rilevanti nel test set.")
 
     # tau on the same users, so the two ratios are directly comparable.
     attributions = []
@@ -83,23 +98,25 @@ def main():
     print(f"   ({summary['n_users']} utenti, {summary['n_positives']} item rilevanti)\n")
     print(f"    {'canale':12} {'Recall@' + str(args.topk):>12} {'NDCG@' + str(args.topk):>12} {'AUC':>10}")
     for name, data in summary['quality'].items():
-        auc = data['auc']
-        print(f"    {name:12} {data[f'recall_at_{args.topk}']:>12.4f} "
-              f"{data[f'ndcg_at_{args.topk}']:>12.4f} {auc:>10.4f}"
-              if auc is not None else f"    {name:12}")
+        # A missing value must not drop the whole row, as it did when the
+        # f-string was the branch of a conditional expression.
+        cells = [_fmt(data.get(f'recall_at_{args.topk}'), 12),
+                 _fmt(data.get(f'ndcg_at_{args.topk}'), 12),
+                 _fmt(data.get('auc'), 10)]
+        print(f"    {name:12} " + " ".join(cells))
 
     disentangled_share = summary['decision'].pop('_disentangled_margin_share')
     print(f"\n{'=' * 72}\n2. CONTRIBUTO AL PUNTEGGIO CONTRO CONTRIBUTO ALLA DECISIONE\n{'=' * 72}")
     print(f"    {'canale':12} {'delta':>10} {'quota con segno':>18} {'voto corretto':>16}")
     for name, data in summary['decision'].items():
-        print(f"    {name:12} {data['delta']:>10.4f} {data['signed_share']:>18.4f} "
+        print(f"    {name:12} {_fmt(data['delta'], 10)} {_fmt(data['signed_share'], 18)} "
               f"{data['vote_accuracy'] * 100:>15.1f}%")
 
-    print(f"\n    Quota del margine che passa dal disentanglement : {disentangled_share:.4f}")
+    print(f"\n    Quota del margine che passa dal disentanglement : {_fmt(disentangled_share, 6)}")
     print(f"    (il resto lo porta il canale collaborativo grezzo)")
     print(f"\n    Confronto a denominatore uguale, solo shared/specific:")
     print(f"      tau   (quota del punteggio) : {summary['tau_pooled']:.4f}")
-    print(f"      delta (quota del margine)   : {summary['decision']['shared']['delta_disentangled']:.4f}")
+    print(f"      delta (quota del margine)   : {_fmt(summary['decision']['shared']['delta_disentangled'], 6)}")
     print(f"\n    accuratezza sulle coppie, punteggio pieno : {summary['pair_accuracy'] * 100:.1f}%"
           f"   (caso: 50.0%)")
 

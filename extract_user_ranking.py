@@ -10,9 +10,9 @@ np.bool = bool
 from recbole.evaluator.metrics import Hit, Recall, NDCG, MRR
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
-MODEL_PATH = 'saved/DGCDR-Aug-06-2026_11-46-49-CDs_Instruments-42.pth'
-TARGET_META_FILE = 'item_metadata/meta_Musical_Instruments.jsonl'
-SOURCE_META_FILE = 'item_metadata/meta_CDs_and_Vinyl.jsonl'
+MODEL_PATH = 'saved/DGCDR-Aug-06-2026_17-41-44.pth'
+TARGET_META_FILE = 'meta_Musical_Instruments.jsonl'
+SOURCE_META_FILE = 'meta_CDs_and_Vinyl.jsonl'
 TOPK = 20
 
 # This model is evaluated with repeatable=True, so the sampler hands the loader an
@@ -40,13 +40,31 @@ def items_of_user(dataset, uid_field, iid_field, uid):
     return [int(i) for u, i in zip(users, items) if int(u) == uid]
 
 
+def resolve_meta(name):
+    """Path of a metadata dump: it sits inside a directory of the same name."""
+    for candidate in (os.path.join(name, name), name):
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(f"metadata dump not found: tried {os.path.join(name, name)} and {name}")
+
+
 def load_titles(meta_file, wanted):
-    """ASIN -> title, reading the metadata dump one line at a time."""
+    """ASIN -> title, reading the metadata dump one line at a time.
+
+    The dumps are hundreds of MB, so this must stay a single streamed pass:
+    call it once with every ASIN needed, never once per user.
+    """
     titles = {}
-    print(f"Scanning {meta_file} for titles...")
-    with open(meta_file, 'r', encoding='utf-8') as f:
+    if not wanted:
+        return titles
+    path = resolve_meta(meta_file)
+    print(f"Scanning {path} for {len(wanted)} titles...")
+    with open(path, 'r', encoding='utf-8') as f:
         for line in f:
-            data = json.loads(line)
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a truncated line must not abandon the whole scan
             asin = data.get('parent_asin', '')
             if asin in wanted:
                 titles[asin] = data.get('title', 'Unknown Title')
@@ -67,9 +85,9 @@ def user_metrics(ranked_ids, positives, config):
     }
 
 
-def truncate(title, width):
-    # Titles are no longer truncated for markdown tables
-    return title
+def md_cell(text):
+    """Titles are not truncated, but a raw '|' or newline would break the table."""
+    return str(text).replace('|', '\\|').replace('\r', ' ').replace('\n', ' ').strip()
 
 
 def main():
@@ -122,8 +140,13 @@ def main():
     ground_truth_ids = [target_iid_to_token[int(i)] for i in user_pos_items]
     seen_item_ids = [target_iid_to_token[i] for i in seen_items]
 
+    # Source history is resolved here too, so each dump is scanned exactly once.
+    source_items = items_of_user(source_ds, source_uid_field, source_iid_field, target_uid)
+    source_item_ids = [source_iid_to_token[i] for i in source_items]
+
     item_metadata = load_titles(TARGET_META_FILE,
                                 set(external_item_ids + ground_truth_ids + seen_item_ids))
+    source_item_metadata = load_titles(SOURCE_META_FILE, set(source_item_ids))
 
     shown = user_metrics(topk_indices, user_pos_items, config)
     native = user_metrics(recbole_indices, user_pos_items, config)
@@ -135,7 +158,7 @@ def main():
     output_lines.append("|---|---|---|---|")
 
     for i, ext_id in enumerate(external_item_ids, 1):
-        title = truncate(item_metadata.get(ext_id, 'Unknown Title'), 47)
+        title = md_cell(item_metadata.get(ext_id, 'Unknown Title'))
         rel_str = "Yes" if int(topk_indices[i - 1]) in user_pos_items else "No"
         output_lines.append(f"| {i} | {rel_str} | {ext_id} | {title} |")
 
@@ -158,19 +181,15 @@ def main():
     output_lines.append("| Item ID | Title |")
     output_lines.append("|---|---|")
     for ext_id in ground_truth_ids:
-        output_lines.append(f"| {ext_id} | {truncate(item_metadata.get(ext_id, 'Unknown Title'), 72)} |")
+        output_lines.append(f"| {ext_id} | {md_cell(item_metadata.get(ext_id, 'Unknown Title'))} |")
 
     # === Source Domain History ===
-    source_items = items_of_user(source_ds, source_uid_field, source_iid_field, target_uid)
-    source_item_ids = [source_iid_to_token[i] for i in source_items]
-    source_item_metadata = load_titles(SOURCE_META_FILE, set(source_item_ids))
-
     output_lines.append("\n<br>\n")
     output_lines.append("## SOURCE DOMAIN HISTORY (AmazonCDs)\n")
     output_lines.append("| Item ID | Title |")
     output_lines.append("|---|---|")
     for item_id in source_item_ids:
-        output_lines.append(f"| {item_id} | {truncate(source_item_metadata.get(item_id, 'Unknown Title'), 72)} |")
+        output_lines.append(f"| {item_id} | {md_cell(source_item_metadata.get(item_id, 'Unknown Title'))} |")
 
     # === Target Domain History (train + valid, i.e. what the model was fitted on) ===
     output_lines.append("\n<br>\n")
@@ -178,7 +197,7 @@ def main():
     output_lines.append("| Item ID | Title |")
     output_lines.append("|---|---|")
     for item_id in seen_item_ids:
-        output_lines.append(f"| {item_id} | {truncate(item_metadata.get(item_id, 'Unknown Title'), 72)} |")
+        output_lines.append(f"| {item_id} | {md_cell(item_metadata.get(item_id, 'Unknown Title'))} |")
 
     final_output = "\n".join(output_lines)
     print("\n" + final_output)
