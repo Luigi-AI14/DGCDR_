@@ -9,16 +9,25 @@ Checks, against a real checkpoint, that:
 Run it after touching anything in this module, or on a new checkpoint before
 trusting the attributions it produces:
 
-    python -m extensions.explainability.test_decomposition -m saved/<ckpt>.pth
+    python -m extensions.explainability.decomposition.test_decomposition -m saved/<ckpt>.pth
 """
 
 import argparse
+import os
 import sys
+
+# This script lives three levels below the repository root, so running it by
+# path puts its own directory on sys.path instead of the root, and neither
+# recbole_cdr nor extensions resolves. Put the root back before importing them.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     os.pardir, os.pardir, os.pardir))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
-from extensions.explainability.attribution import explain_user
-from extensions.explainability.channels import (
+from extensions.explainability.decomposition.core.attribution import explain_user
+from extensions.explainability.decomposition.core.channels import (
     decompose_target_domain,
     verify_decomposition,
 )

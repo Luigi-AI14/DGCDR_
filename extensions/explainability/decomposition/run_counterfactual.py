@@ -3,7 +3,7 @@
 Zeroes the shared channel on the user side, re-ranks every sampled user, and
 reports what it cost and whether tau predicted it.
 
-    python run_counterfactual.py -m saved/DGCDR-Jul-25-2026_11-32-27.pth
+    python -m extensions.explainability.decomposition.run_counterfactual -m saved/DGCDR-Jul-25-2026_11-32-27.pth
 
 The second question is the one that matters. tau claims a recommendation leans
 on the shared channel; the honest test of that claim is whether the
@@ -13,22 +13,31 @@ recommendation actually falls apart when the channel is taken away.
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+
+# This script lives three levels below the repository root, so running it by
+# path puts its own directory on sys.path instead of the root, and neither
+# recbole_cdr nor extensions resolves. Put the root back before importing them.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     os.pardir, os.pardir, os.pardir))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
-from extensions.explainability.attribution import explain_user
-from extensions.explainability.channels import (
+from extensions.explainability.decomposition.core.attribution import explain_user
+from extensions.explainability.decomposition.core.channels import (
     SHARED,
     decompose_target_domain,
     verify_decomposition,
 )
-from extensions.explainability.counterfactual import (
+from extensions.explainability.decomposition.core.counterfactual import (
     counterfactual_for_user,
     prepare,
     summarise,
 )
-from extensions.explainability.data import build_ground_truth, select_users
+from extensions.explainability.decomposition.core.data import build_ground_truth, select_users
 
 
 def main():

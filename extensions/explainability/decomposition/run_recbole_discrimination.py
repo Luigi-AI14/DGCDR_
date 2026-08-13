@@ -1,7 +1,16 @@
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+
+# This script lives three levels below the repository root, so running it by
+# path puts its own directory on sys.path instead of the root, and neither
+# recbole_cdr nor extensions resolves. Put the root back before importing them.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     os.pardir, os.pardir, os.pardir))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import numpy as np
 # Patch numpy deprecated aliases used by RecBole
@@ -14,13 +23,13 @@ import torch
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 from recbole_cdr.trainer import CrossDomainTrainer
 
-from extensions.explainability.attribution import explain_user, pooled_transfer_ratio
-from extensions.explainability.channels import (
+from extensions.explainability.decomposition.core.attribution import explain_user, pooled_transfer_ratio
+from extensions.explainability.decomposition.core.channels import (
     decompose_target_domain,
     verify_decomposition,
 )
-from extensions.explainability.discrimination import analyse_user, summarise
-from extensions.explainability.data import build_ground_truth, select_users
+from extensions.explainability.decomposition.core.discrimination import analyse_user, summarise
+from extensions.explainability.decomposition.core.data import build_ground_truth, select_users
 
 
 def _fmt(value, width, places=4):

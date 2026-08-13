@@ -18,6 +18,7 @@ saved/
 log/
 log_tensorboard/
 discrimination_out/
+counterfactual_out/
 ranking_logs/
 
 # Specific local files to ignore
