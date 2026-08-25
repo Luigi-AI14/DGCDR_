@@ -42,7 +42,7 @@ Three controls make the numbers readable:
 import numpy as np
 import torch
 
-from extensions.explainability.channels import BASE, SHARED, SPECIFIC
+from extensions.explainability.decomposition.core.channels import BASE, SHARED, SPECIFIC
 
 
 def channel_score_vectors(model, decomposition, user_id):

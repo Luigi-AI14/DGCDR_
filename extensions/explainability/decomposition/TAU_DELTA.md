@@ -165,8 +165,8 @@ Il framework è **interamente numerico**: non genera testo e non dipende da alcu
 ## 7. Comandi Utili
 
 ```bash
-python -m extensions.explainability.test_decomposition -m saved/<ckpt>.pth
-python run_discrimination.py -m saved/<ckpt>.pth -n 300
+python -m extensions.explainability.decomposition.test_decomposition -m saved/<ckpt>.pth
+python -m extensions.explainability.decomposition.run_discrimination -m saved/<ckpt>.pth -n 300
 ```
 
 Il primo comando funge da validazione: deve superare tutti i test (**9/9**), altrimenti τ e δ verrebbero calcolati su una decomposizione che non rispecchia fedelmente l'output del modello.

@@ -1,8 +1,18 @@
 import numpy as np
 import json
-import torch
 import os
 import random
+import sys
+
+# This script lives three levels below the repository root, so running it by
+# path puts its own directory on sys.path instead of the root, and neither
+# recbole_cdr nor extensions resolves. Put the root back before importing them.
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                     os.pardir, os.pardir, os.pardir))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import torch
 
 np.float = float
 np.int = int
@@ -11,7 +21,10 @@ np.bool = bool
 from recbole.evaluator.metrics import Hit, Recall, NDCG, MRR
 from recbole_cdr.quick_start.quick_start import load_data_and_model
 
-from ranking_payload import domain_names, user_json
+from extensions.explainability.ranking_reports.core.ranking_payload import (
+    domain_names,
+    user_json,
+)
 
 MODEL_PATH = 'saved/DGCDR-Aug-06-2026_17-41-44.pth'
 TARGET_META_FILE = 'meta_Musical_Instruments.jsonl'

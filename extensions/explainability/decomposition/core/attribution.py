@@ -15,7 +15,7 @@ opposed to preferences native to the target domain.
 
 import torch
 
-from extensions.explainability.channels import BASE, SHARED, SPECIFIC
+from extensions.explainability.decomposition.core.channels import BASE, SHARED, SPECIFIC
 
 
 class ItemAttribution:
