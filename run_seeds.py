@@ -25,12 +25,19 @@ def main():
         default=None,
         help="Optional model name to forward to run_recbole_cdr.py (e.g. DGCDR, BiTGCF, DCCDR, DTCDR)",
     )
+    parser.add_argument(
+        "--script",
+        type=str,
+        default="run_recbole_cdr.py",
+        help="Target script to execute across seeds (e.g. run_recbole_cdr.py, run_lightgcn.py, run_dgcf.py)",
+    )
 
     args, unknown_args = parser.parse_known_args()
     total_seeds = len(args.seeds)
 
     print("=" * 60)
-    print("Multi-Seed Execution Runner for RecBole CDR")
+    print("Multi-Seed Execution Runner")
+    print(f"Target script: {args.script}")
     print(f"Seeds to execute ({total_seeds}): {args.seeds}")
     if args.model:
         print(f"Model override: {args.model}")
@@ -43,7 +50,7 @@ def main():
     for idx, seed in enumerate(args.seeds, start=1):
         print(f"\n[{idx}/{total_seeds}] >>> Starting run with seed: {seed} <<<\n")
         
-        cmd = [sys.executable, "run_recbole_cdr.py", f"--seed={seed}"]
+        cmd = [sys.executable, args.script, f"--seed={seed}"]
         if args.model:
             cmd.extend(["--model", args.model])
         if unknown_args:

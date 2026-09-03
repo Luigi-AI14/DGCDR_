@@ -1,4 +1,18 @@
 import argparse
+import numpy as np
+
+# NumPy >= 1.24 compatibility aliases for RecBole 1.0.1
+for _attr, _target in [
+    ('bool', bool),
+    ('int', int),
+    ('float', float),
+    ('complex', complex),
+    ('object', object),
+    ('str', str),
+]:
+    if not hasattr(np, _attr):
+        setattr(np, _attr, _target)
+
 from recbole.quick_start import run_recbole
 
 if __name__ == '__main__':
@@ -29,8 +43,10 @@ if __name__ == '__main__':
                         help='number of routing iterations')
     parser.add_argument('--cor_weight', type=float, default=0.01,
                         help='weight of correlation regularization loss')
+    parser.add_argument('--seed', '-s', type=int, default=2022,
+                        help='random seed')
 
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     # Validate that embedding_size is divisible by n_factors
     if args.embedding_size % args.n_factors != 0:
@@ -46,6 +62,7 @@ if __name__ == '__main__':
         'use_gpu': True,
         'state': 'INFO',
         'reproducibility': True,
+        'seed': args.seed,
         'data_path': data_path,
         'checkpoint_dir': os.path.join(current_dir, 'saved'),
         'save_dataset': False,

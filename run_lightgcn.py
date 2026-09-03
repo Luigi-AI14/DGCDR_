@@ -1,4 +1,18 @@
 import argparse
+import numpy as np
+
+# NumPy >= 1.24 compatibility aliases for RecBole 1.0.1
+for _attr, _target in [
+    ('bool', bool),
+    ('int', int),
+    ('float', float),
+    ('complex', complex),
+    ('object', object),
+    ('str', str),
+]:
+    if not hasattr(np, _attr):
+        setattr(np, _attr, _target)
+
 from recbole.quick_start import run_recbole
 
 if __name__ == '__main__':
@@ -21,8 +35,10 @@ if __name__ == '__main__':
                         help='number of GCN layers')
     parser.add_argument('--reg_weight', type=float, default=1e-05,
                         help='L2 regularization weight')
+    parser.add_argument('--seed', '-s', type=int, default=2022,
+                        help='random seed')
 
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     import os
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +50,7 @@ if __name__ == '__main__':
         'use_gpu': True,
         'state': 'INFO',
         'reproducibility': True,
+        'seed': args.seed,
         'data_path': data_path,
         'checkpoint_dir': os.path.join(current_dir, 'saved'),
         'save_dataset': False,
