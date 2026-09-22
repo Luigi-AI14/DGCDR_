@@ -2,3 +2,10 @@
 .DS_Store
 **/.DS_Store
 .DS_Store?
+*.pth
+*.pyc
+/log
+/log_tensorboard
+/ranking_logs
+*.json
+*.jsonl
