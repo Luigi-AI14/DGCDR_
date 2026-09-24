@@ -45,7 +45,7 @@ os.environ.setdefault('MPLCONFIGDIR', str(ROOT / 'transfer_results/.matplotlib')
 
 def atomic_json(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(value, indent=2, default=str) + '\n')
+    tmp.write_text(json.dumps(value, indent=2, default=str) + '\n', encoding='utf-8')
     tmp.replace(path)
 
 
@@ -276,7 +276,7 @@ def write_csv(spec, out, results):
         raise ValueError('No users to compare')
     path = out / 'per_user.csv'
     tmp = path.with_suffix('.tmp')
-    with tmp.open('w', newline='') as f:
+    with tmp.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
@@ -288,7 +288,7 @@ def report(spec, out):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str})
+    df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
     if df.duplicated(['user_id', 'seed']).any() or not df.groupby('user_id').seed.apply(
             lambda s: set(s) == set(spec['seeds'])).all():
         raise ValueError('Missing or duplicated seed results')
@@ -316,7 +316,7 @@ def report(spec, out):
     def table(headers, rows):
         return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---']*len(headers)) + '|\n' + ''.join(
             '| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |\n' for row in rows)
-    audits = json.loads((out / 'config.json').read_text())['seeds']
+    audits = json.loads((out / 'config.json').read_text(encoding='utf-8'))['seeds']
     policies = {(a['repeatable'], str(a['threshold_dgcdr']), str(a['threshold_lightgcn']))
                 for a in audits.values()}
     if len(policies) != 1:
@@ -367,7 +367,7 @@ def report(spec, out):
         'la coincidenza con il test storico non è dimostrabile dai soli pesi. '
         'Gli intervalli ricampionano gli utenti e sono condizionati ai seed e split osservati; '
         'le differenze DGCDR/LightGCN non isolano causalmente l’effetto del source.\n'])
-    (out / 'report.md').write_text('\n'.join(lines))
+    (out / 'report.md').write_text('\n'.join(lines), encoding='utf-8')
     user_lines = ['# Confronto utenti test\n[Report generale](report.md)\n',
                   'Metriche medie sui seed; conteggi medi riferiti al training. [Negative](#negative) · [Neutral](#neutral) · [Positive](#positive)\n']
     for cls in ['Negative','Neutral','Positive']:
@@ -377,7 +377,7 @@ def report(spec, out):
              '%.6f'%r.delta_ndcg,'%d/%d'%(r.negative_seeds,len(spec['seeds'])),'%.6f'%r.std_delta] for u,r in group.iterrows()]),
             '### Recall — '+cls+'\n', table(['Utente','Recall LGCN','Recall DGCDR','Delta'],[
                 [u,'%.6f'%r.recall_lightgcn,'%.6f'%r.recall_dgcdr,'%.6f'%r.delta_recall] for u,r in group.iterrows()])])
-    (out / 'users.md').write_text('\n'.join(user_lines))
+    (out / 'users.md').write_text('\n'.join(user_lines), encoding='utf-8')
     fig, ax = plt.subplots(figsize=(8,4))
     ax.hist(values, bins=50, color='#4878a8')
     ax.axvline(0,color='black',linewidth=1)
@@ -400,7 +400,7 @@ def report(spec, out):
         fig.tight_layout()
         fig.savefig(out / filename,dpi=160)
         plt.close(fig)
-    with (out / 'report.md').open('a') as f:
+    with (out / 'report.md').open('a', encoding='utf-8') as f:
         f.write('\n![Delta per attività](activity_delta.png)\n\n![Negative per attività](activity_negative.png)\n')
 
 
@@ -418,7 +418,7 @@ def main():
     args = parser.parse_args()
     # RecBole parses sys.argv itself; keep this entry point's arguments out of it.
     sys.argv = [sys.argv[0]]
-    spec = yaml.safe_load(Path(args.config).read_text())
+    spec = yaml.safe_load(Path(args.config).read_text(encoding='utf-8'))
     spec['seeds'] = args.seeds
     if args.source or args.target:
         if not args.output:
@@ -430,7 +430,7 @@ def main():
     torch.set_num_threads(spec['threads'])
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     if args.stage == 'report':
-        saved = json.loads((out/'config.json').read_text())
+        saved = json.loads((out/'config.json').read_text(encoding='utf-8'))
         report(saved['spec'],out)
         return
     paths = checkpoint_paths(spec, args)
