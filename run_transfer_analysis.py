@@ -1,4 +1,17 @@
-"""Evaluate existing DGCDR and LightGCN checkpoints without training."""
+r"""Evaluate existing DGCDR and LightGCN checkpoints without training.
+
+python run_transfer_analysis.py \
+  --source 'NOME_DATASET_SOURCE_PET' \
+  --target 'NOME_DATASET_TARGET_BEAUTY' \
+  --checkpoint-dir saved \
+  --output transfer_results/pet_to_beauty
+
+python run_transfer_analysis.py \
+  --source AmazonCDs_AmazonInstruments_commonUser_3-core \
+  --target AmazonInstruments_AmazonCDs_commonUser_3-core \
+  --checkpoint-dir saved \
+  --output transfer_results/cds_to_instruments
+"""
 import argparse
 import csv
 import json
@@ -133,7 +146,9 @@ def checkpoint_paths(spec, args):
             config = state['config']
             key = (config['model'], int(config['seed']))
             target = config['target_domain']['dataset'] if key[0] == 'DGCDR' else config['dataset']
-            if key in wanted and target == spec['target']:
+            source_matches = (key[0] != 'DGCDR' or
+                              config['source_domain']['dataset'] == spec['source'])
+            if key in wanted and target == spec['target'] and source_matches:
                 found.setdefault(key, []).append(path)
     for key in sorted(wanted):
         matches = found.get(key, [])
