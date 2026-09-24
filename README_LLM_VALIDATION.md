@@ -16,8 +16,9 @@ DGCDR_/
 │   ├── prompt_builder.py     # Prompt formatter in English + prompt file writer
 │   ├── data_extractor.py     # RecBole split loader (seed 42), text filter, instant cache loader
 │   └── compact_builder.py    # Preprocessor for lightweight compact metadata & reviews
-├── saved_prompts/            # Saved prompt text files for every evaluated user
-│   └── prompt_<user_id>.txt
+├── saved_prompts/            # Saved prompts organized into subfolders per validation run
+│   └── prompt_<result_json_basename>/
+│       └── prompt_<user_id>.txt
 ├── results/                  # Detailed validation JSON reports
 │   └── validation_<domain_pair>_<N>users_<timestamp>.json
 ├── cache/                    # Compact dataset caches (compact_<pair>.pkl & compact_<pair>.json)

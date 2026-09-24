@@ -152,6 +152,16 @@ def main():
         logger.error("No eligible users found matching all constraints!")
         sys.exit(1)
 
+    # Prepare output filenames and dedicated run prompt directory
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_basename = f"validation_{args.domain_pair}_{len(users_data)}users_{run_timestamp}"
+    output_filename = f"{output_basename}.json"
+    output_filepath = os.path.join(args.output_dir, output_filename)
+
+    run_prompts_dir = os.path.join(args.prompts_dir, f"prompt_{output_basename}")
+    os.makedirs(run_prompts_dir, exist_ok=True)
+    logger.info(f"Prompts for this run will be saved in: {run_prompts_dir}")
+
     all_user_results = []
     global_bleu_scores = []
     global_r1_scores = []
@@ -168,7 +178,7 @@ def main():
         )
         logger.info(f"  Held-out items to explain: {len(user['held_out_items'])}")
 
-        # Build prompt & save to file
+        # Build prompt & save to dedicated run directory
         recommended_for_prompt = [
             {"item_id": it["item_id"], "item_title": it["item_title"]}
             for it in user["held_out_items"]
@@ -181,7 +191,7 @@ def main():
             source_history=user["source_history"],
             target_history=user["target_history"],
             recommended_items=recommended_for_prompt,
-            prompts_dir=args.prompts_dir,
+            prompts_dir=run_prompts_dir,
         )
         logger.info(f"  Prompt generated and saved to: {prompt_file}")
 
@@ -271,10 +281,6 @@ def main():
     macro_r2 = round(sum(global_r2_scores) / len(global_r2_scores), 4) if global_r2_scores else 0.0
     macro_rl = round(sum(global_rl_scores) / len(global_rl_scores), 4) if global_rl_scores else 0.0
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"validation_{args.domain_pair}_{len(users_data)}users_{timestamp}.json"
-    output_filepath = os.path.join(args.output_dir, output_filename)
-
     final_report = {
         "timestamp": datetime.datetime.now().isoformat(),
         "domain_pair": args.domain_pair,
@@ -286,6 +292,7 @@ def main():
         "rating_threshold": args.rating_threshold,
         "num_users": len(users_data),
         "total_held_out_items_evaluated": len(global_bleu_scores),
+        "prompts_dir": run_prompts_dir,
         "users": all_user_results,
         "global_averages": {
             "macro_avg_bleu": macro_bleu,
@@ -308,7 +315,7 @@ def main():
     print(f"Macro Average ROUGE-2 (F1):      {macro_r2:.4f}")
     print(f"Macro Average ROUGE-L (F1):      {macro_rl:.4f}")
     print(f"Saved Results JSON:              {output_filepath}")
-    print(f"Saved Prompts Directory:         {args.prompts_dir}")
+    print(f"Saved Prompts Directory:         {run_prompts_dir}")
     print("=" * 80 + "\n")
 
 
