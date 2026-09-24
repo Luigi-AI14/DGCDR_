@@ -12,3 +12,5 @@
 # Local transfer experiments and optional plotting runtime
 /transfer_results/
 /.transfer_plotting/
+/trained_checkpoints/
+
