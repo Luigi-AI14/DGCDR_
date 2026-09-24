@@ -1,27 +1,29 @@
-"""Paired DGCDR / native RecBole LightGCN experiment (RecBole 1.0.1)."""
+"""Evaluate existing DGCDR and LightGCN checkpoints without training."""
 import argparse
 import csv
-import hashlib
 import json
 import logging
 import os
 from pathlib import Path
-import pickle
 import sys
 
 import numpy as np
 import torch
 import yaml
-from recbole.config import Config
+from recbole.data import create_dataset as create_light_dataset
+from recbole.data import data_preparation as prepare_light_data
 from recbole.model.general_recommender.lightgcn import LightGCN
-from recbole.trainer import Trainer
 from recbole.utils import init_seed
-from recbole_cdr.config import CDRConfig
 from recbole_cdr.data import create_dataset, data_preparation
 from recbole_cdr.model.cross_domain_recommender.dgcdr import DGCDR
-from recbole_cdr.trainer import CrossDomainTrainer
 
 ROOT = Path(__file__).resolve().parent
+# Defaults can be edited here; command-line options and YAML entries override them.
+DEFAULT_CHECKPOINT_DIR = ROOT / 'saved'
+CHECKPOINT_OVERRIDES = {
+    # 'DGCDR': {2022: '/absolute/path/to/DGCDR-checkpoint.pth'},
+    # 'LightGCN': {2022: '/absolute/path/to/LightGCN-checkpoint.pth'},
+}
 # Optional plotting dependencies installed locally; leave the training environment unchanged.
 if (ROOT / '.transfer_plotting').exists():
     sys.path.append(str(ROOT / '.transfer_plotting'))
@@ -46,57 +48,99 @@ def histories(dataset):
     return result
 
 
-def cdr_config(spec, out):
-    override = dict(seed=spec['split_seed'], use_gpu=spec['use_gpu'], repeatable=False,
-                    train_epochs=['BOTH:%d' % spec['epochs']],
-                    stopping_step=spec['patience'], train_batch_size=spec['train_batch_size'],
-                    eval_batch_size=spec['eval_batch_size'], metrics=['Recall', 'NDCG'],
-                    topk=[spec['k']], valid_metric='Recall@%d' % spec['k'],
-                    metric_decimal_place=10, show_progress=False, log_wandb=False,
-                    save_dataset=False, save_dataloaders=False, dataset_save_path=None,
-                    dataloaders_save_path=None, checkpoint_dir=str(out),
-                    rm_dup_inter='first', threshold=None,
-                    eval_args={'split': {'RS': [0.6, 0.2, 0.2]}, 'order': 'RO',
-                               'group_by': 'user', 'mode': 'full'})
-    for domain in ('source', 'target'):
-        override[domain + '_domain'] = dict(dataset=spec[domain], data_path=str(ROOT / 'dataset'),
-                                           threshold=None, load_col={'inter': ['user_id', 'item_id']},
-                                           rm_dup_inter='first', val_interval=None)
-    return CDRConfig(model='DGCDR', config_file_list=[str(ROOT / spec['dataset_config']),
-                     str(ROOT / 'recbole_cdr/properties/model/DGCDR.yaml')], config_dict=override)
+def token_map(dataset, field):
+    # In some DGCDR datasets id2token is stale after remapping; invert the live map.
+    inverse = {int(index): str(token) for token, index in dataset.field2token_id[field].items()}
+    if len(inverse) != len(dataset.field2token_id[field]):
+        raise ValueError('Non-unique token mapping for ' + field)
+    return inverse
 
 
-def validate_data(train, valid, test):
-    t = train.target_dataset
-    tp, vp, ep = (pairs(x) for x in (t, valid.dataset, test.dataset))
-    if tp & vp or tp & ep or vp & ep:
-        raise ValueError('Target train/validation/test overlap')
-    for d in (t, valid.dataset, test.dataset, train.source_dataset):
-        if len(pairs(d)) != len(d):
-            raise ValueError('Duplicate interactions remain')
-    th, vh, eh = (histories(x) for x in (t, valid.dataset, test.dataset))
-    for loader, expected, positives in ((valid, th, vh),
-                                       (test, {u: th.get(u, set()) | vh.get(u, set())
-                                               for u in set(th) | set(vh)}, eh)):
-        for inter, history, pu, pi in loader:
-            users = inter[t.uid_field].tolist()
-            actual_history = {u: set() for u in users}
-            if history is not None:
-                for row, item in zip(history[0].tolist(), history[1].tolist()):
-                    actual_history[users[row]].add(item)
-            actual_pos = {u: set() for u in users}
-            for row, item in zip(pu.tolist(), pi.tolist()):
-                actual_pos[users[row]].add(item)
-            for u in users:
-                if actual_history[u] != expected.get(u, set()) or actual_pos[u] != positives[u]:
-                    raise ValueError('Evaluation masks or positives differ from frozen split')
-    if not set(eh).issubset(th):
-        raise ValueError('Test users without target training history')
-    return {'target_train': len(tp), 'target_valid': len(vp), 'target_test': len(ep),
-            'source_train': len(train.source_dataset), 'test_users': len(eh),
-            'target_items': t.item_num - 1,
-            'users_without_test': len(set(th) - set(eh)),
-            'test_items_without_train': len({i for _, i in ep} - {i for _, i in tp})}
+def token_pairs(dataset):
+    users = token_map(dataset, dataset.uid_field)
+    items = token_map(dataset, dataset.iid_field)
+    return {(users[u], items[i]) for u, i in pairs(dataset)}
+
+
+def token_histories(dataset):
+    result = {}
+    for user, item in token_pairs(dataset):
+        result.setdefault(user, set()).add(item)
+    return result
+
+
+def checkpoint_config(state, path, model, seed, spec, out):
+    config = state['config']
+    if config['model'] != model or int(config['seed']) != seed:
+        raise ValueError(f'{path}: checkpoint model/seed differs from requested {model}/{seed}')
+    target = config['target_domain']['dataset'] if model == 'DGCDR' else config['dataset']
+    if target != spec['target']:
+        raise ValueError(f'{path}: target domain {target} differs from {spec["target"]}')
+    if model == 'DGCDR' and config['source_domain']['dataset'] != spec['source']:
+        raise ValueError(f'{path}: unexpected source domain')
+    # Checkpoints may contain absolute paths from another computer. Change paths only.
+    if model == 'DGCDR':
+        for domain in ('source', 'target'):
+            name = config[domain + '_domain']['dataset']
+            config[domain + '_domain']['data_path'] = str(ROOT / 'dataset' / name)
+    else:
+        config['data_path'] = str(ROOT / 'dataset' / target)
+    config['use_gpu'] = bool(spec.get('use_gpu', False))
+    config['device'] = torch.device('cuda' if config['use_gpu'] and torch.cuda.is_available() else 'cpu')
+    config['checkpoint_dir'] = str(out / '_no_saved_dataloaders' / model / str(seed))
+    config['dataloaders_save_path'] = None
+    config['save_dataloaders'] = False
+    config['save_dataset'] = False
+    return config
+
+
+def checkpoint_paths(spec, args):
+    """Explicit YAML/CLI paths take precedence; discover remaining .pth by metadata."""
+    explicit = {}
+    for model, entries in {**CHECKPOINT_OVERRIDES, **spec.get('checkpoints', {})}.items():
+        if model not in ('DGCDR', 'LightGCN'):
+            raise ValueError('Unknown checkpoint model: ' + model)
+        for seed, filename in entries.items():
+            explicit[(model, int(seed))] = Path(filename).expanduser().resolve()
+    for entry in args.checkpoint:
+        try:
+            key, filename = entry.split('=', 1)
+            model, seed = key.split(':', 1)
+            if model not in ('DGCDR', 'LightGCN'):
+                raise ValueError()
+            explicit[(model, int(seed))] = Path(filename).expanduser().resolve()
+        except ValueError as exc:
+            raise ValueError('Use --checkpoint MODEL:SEED=/path/to/model.pth') from exc
+    wanted = {(model, seed) for seed in spec['seeds'] for model in ('DGCDR', 'LightGCN')}
+    for key, path in explicit.items():
+        if key not in wanted or not path.is_file():
+            raise ValueError(f'Unexpected or missing checkpoint {key}: {path}')
+    found = {key: [path] for key, path in explicit.items()}
+    if wanted - explicit.keys():
+        directory = Path(args.checkpoint_dir or spec.get('checkpoint_dir', DEFAULT_CHECKPOINT_DIR)).expanduser()
+        if not directory.is_absolute():
+            directory = ROOT / directory
+        if not directory.is_dir():
+            raise FileNotFoundError(f'Checkpoint directory not found: {directory}')
+        for path in directory.rglob('*.pth'):
+            if 'dataloader' in path.name or path in explicit.values():
+                continue
+            if not path.name.startswith(('DGCDR-', 'LightGCN-')):
+                continue
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            if 'config' not in state or 'state_dict' not in state:
+                continue
+            config = state['config']
+            key = (config['model'], int(config['seed']))
+            target = config['target_domain']['dataset'] if key[0] == 'DGCDR' else config['dataset']
+            if key in wanted and target == spec['target']:
+                found.setdefault(key, []).append(path)
+    for key in sorted(wanted):
+        matches = found.get(key, [])
+        if len(matches) != 1:
+            raise ValueError(f'Expected exactly one {key} checkpoint; found {matches}. '
+                             'Specify the intended file with --checkpoint or checkpoints in YAML.')
+    return {key: paths[0] for key, paths in found.items()}
 
 
 @torch.no_grad()
@@ -138,149 +182,83 @@ def individual_metrics(model, loader, device, k):
     return output
 
 
-class SharedEvaluation:
-    """Use exactly the same ranking rules during validation and final test."""
-    def evaluate(self, eval_data, load_best_model=True, model_file=None, show_progress=False):
-        if load_best_model:
-            state = torch.load(model_file or self.saved_model_file, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(state['state_dict'])
-        metrics = individual_metrics(self.model, eval_data, self.device, self.config['topk'][0])
-        values = np.array(list(metrics.values()))
-        k = self.config['topk'][0]
-        return {'ndcg@%d' % k: float(values[:, 0].mean()), 'recall@%d' % k: float(values[:, 1].mean())}
-
-
-class PairedCDRTrainer(SharedEvaluation, CrossDomainTrainer):
-    pass
-
-
-class PairedLightTrainer(SharedEvaluation, Trainer):
-    pass
-
-
-def prepare(spec, out):
-    inputs = {}
-    for domain in ('source', 'target'):
-        path = ROOT / 'dataset' / spec[domain] / (spec[domain] + '.inter')
-        inputs[str(path.relative_to(ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in (ROOT / spec['dataset_config'], ROOT / 'recbole_cdr/properties/model/DGCDR.yaml',
-                 ROOT / 'recbole_cdr/properties/overall.yaml', Path(__file__),
-                 ROOT / 'recbole_cdr/model/cross_domain_recommender/dgcdr.py',
-                 ROOT / 'recbole_cdr/data/dataset.py', ROOT / 'recbole_cdr/data/dataloader.py'):
-        inputs[str(path.relative_to(ROOT))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    import recbole, scipy, pandas
-    environment = dict(python=sys.version, torch=torch.__version__, recbole=recbole.__version__,
-                       numpy=np.__version__, scipy=scipy.__version__, pandas=pandas.__version__)
-    signature = dict(spec=spec, input_hashes=inputs, environment=environment)
-    fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
-    manifest = out / 'config.json'
-    if manifest.exists():
-        if json.loads(manifest.read_text())['fingerprint'] != fingerprint:
-            raise ValueError('Output belongs to another configuration/code/input: choose a new --output')
-    config = cdr_config(spec, out)
-    frozen = out / 'split.pkl'
-    if frozen.exists():
-        with frozen.open('rb') as f:
-            payload = pickle.load(f)
-        if payload['fingerprint'] != fingerprint:
-            raise ValueError('Frozen data belong to a different experiment')
-        train, valid, test = payload['loaders']
-    else:
-        init_seed(spec['split_seed'], True)
+def reconstruct(spec, out, model, seed, path):
+    logging.info('Reconstructing %s seed=%d from %s', model, seed, path)
+    state = torch.load(path, map_location='cpu', weights_only=False)
+    config = checkpoint_config(state, path, model, seed, spec, out)
+    init_seed(seed, config['reproducibility'])
+    if model == 'DGCDR':
         dataset = create_dataset(config)
         train, valid, test = data_preparation(config, dataset)
-        audit = validate_data(train, valid, test)
-        with frozen.with_suffix('.tmp').open('wb') as f:
-            pickle.dump(dict(fingerprint=fingerprint, loaders=(train, valid, test)), f, protocol=4)
-        frozen.with_suffix('.tmp').replace(frozen)
-    audit = validate_data(train, valid, test)
-    signature.update(fingerprint=fingerprint, audit=audit,
-                     dgcdr_resolved=config.final_config_dict)
-    atomic_json(manifest, signature)
-    logging.info('Frozen split verified: %s', audit)
-    return fingerprint
-
-
-def run_model(spec, out, fingerprint, name, seed):
-    with (out / 'split.pkl').open('rb') as f:
-        payload = pickle.load(f)
-        train, valid, test = payload['loaders']
-    target = train.target_dataset
-    config = cdr_config(spec, out)
-    run_dir = out / ('%s_%s' % (name, seed))
-    run_dir.mkdir(exist_ok=True)
-    if name == 'LightGCN':
-        config = Config(model='LightGCN', dataset=spec['target'], config_dict=dict(
-            **spec['lightgcn'], USER_ID_FIELD=target.uid_field, ITEM_ID_FIELD=target.iid_field,
-            NEG_PREFIX='neg_', use_gpu=spec['use_gpu'], seed=seed, epochs=spec['epochs'],
-            train_batch_size=spec['train_batch_size'], eval_batch_size=spec['eval_batch_size'],
-            stopping_step=spec['patience'], metrics=['Recall', 'NDCG'], topk=[spec['k']],
-            valid_metric='Recall@%d' % spec['k'], metric_decimal_place=10,
-            checkpoint_dir=str(run_dir), log_wandb=False, show_progress=False,
-            neg_sampling={'uniform': 1}, require_pow=False))
-    config['seed'] = seed
-    config['checkpoint_dir'] = str(run_dir)
-    init_seed(seed, True)
-    model = (DGCDR(config, train.dataset) if name == 'DGCDR' else LightGCN(config, target)).to(config['device'])
-    matrix = model.target_interaction_matrix if name == 'DGCDR' else model.interaction_matrix
-    if set(zip(matrix.row.tolist(), matrix.col.tolist())) != pairs(target):
-        raise ValueError('Model graph differs from target train')
-    checkpoint = run_dir / 'best.pth'
-    state = torch.load(checkpoint, map_location='cpu', weights_only=False) if checkpoint.exists() else None
-    if state is not None and state.get('transfer_fingerprint') == fingerprint and state.get('transfer_complete'):
-        logging.info('Reusing completed %s seed %d', name, seed)
-        model.load_state_dict(state['state_dict'])
+        target = train.target_dataset
+        source = train.source_dataset
+        model_dataset = train.dataset
     else:
-        log_handler = logging.FileHandler(run_dir / 'training.log', mode='w')
-        logging.getLogger().addHandler(log_handler)
-        trainer = (PairedCDRTrainer if name == 'DGCDR' else PairedLightTrainer)(config, model)
-        trainer.saved_model_file = str(checkpoint)
-        logging.info('START %s seed=%d', name, seed)
-        try:
-            trainer.fit(train if name == 'DGCDR' else train.target_dataloader, valid, show_progress=False)
-            state = torch.load(checkpoint, map_location='cpu', weights_only=False)
-            model.load_state_dict(state['state_dict'])
-            state.update(transfer_fingerprint=fingerprint, transfer_complete=True)
-            tmp = checkpoint.with_suffix('.tmp')
-            torch.save(state, tmp)
-            tmp.replace(checkpoint)
-        finally:
-            trainer.tensorboard.close()
-            logging.getLogger().removeHandler(log_handler)
-            log_handler.close()
-    result = individual_metrics(model, test, config['device'], spec['k'])
-    # Compare the native evaluator on this checkpoint (tie policies may differ).
-    native = Trainer(config, model)
-    native_result = native.evaluate(test, load_best_model=False, show_progress=False)
-    native.tensorboard.close()
-    avg = np.mean(list(result.values()), axis=0)
-    discrepancy = max(abs(native_result['ndcg@%d' % spec['k']] - avg[0]),
-                      abs(native_result['recall@%d' % spec['k']] - avg[1]))
-    if discrepancy > 1e-7:
-        raise ValueError('Native/per-user metric discrepancy %.12g; inspect cutoff ties' % discrepancy)
-    logging.info('DONE %s seed=%d best_epoch=%d test NDCG=%.8f Recall=%.8f',
-                 name, seed, state['epoch'] + 1, avg[0], avg[1])
-    return result
+        dataset = create_light_dataset(config)
+        train, valid, test = prepare_light_data(config, dataset)
+        target = train.dataset
+        source = None
+        model_dataset = target
+    datasets = {'train': target, 'validation': valid.dataset, 'test': test.dataset}
+    splits = {name: token_pairs(data) for name, data in datasets.items()}
+    if splits['train'] & splits['validation'] or splits['train'] & splits['test'] or splits['validation'] & splits['test']:
+        raise ValueError(f'{model}/{seed}: target split overlap')
+    candidates = set(token_map(target, target.iid_field).values()) - {'[PAD]'}
+    init_seed(seed, config['reproducibility'])
+    predictor = (DGCDR(config, model_dataset) if model == 'DGCDR'
+                 else LightGCN(config, model_dataset)).to(config['device'])
+    predictor.load_state_dict(state['state_dict'])
+    if state.get('other_parameter') is not None:
+        predictor.load_other_parameter(state['other_parameter'])
+    matrix = predictor.target_interaction_matrix if model == 'DGCDR' else predictor.interaction_matrix
+    if set(zip(matrix.row.tolist(), matrix.col.tolist())) != pairs(target):
+        raise ValueError(f'{model}/{seed}: model graph differs from reconstructed training data')
+    values = individual_metrics(predictor, test, config['device'], spec['k'])
+    users = token_map(test.dataset, test.dataset.uid_field)
+    result = {users[user]: metrics for user, metrics in values.items()}
+    if len(result) != len(values):
+        raise ValueError(f'{model}/{seed}: duplicate original user ID')
+    logging.info('Evaluated %s seed=%d: %d users, NDCG@%d=%.8f', model, seed,
+                 len(result), spec['k'], np.mean([v[0] for v in result.values()]))
+    return dict(results=result, splits=splits, candidates=candidates,
+                source=token_histories(source) if source is not None else None,
+                target=token_histories(target), test=token_histories(test.dataset),
+                repeatable=bool(config['repeatable']),
+                threshold=(config['target_domain']['threshold'] if model == 'DGCDR'
+                           else config['threshold']))
+
+
+def compare_pair(seed, light, dgcdr):
+    for phase in ('train', 'validation', 'test'):
+        if light['splits'][phase] != dgcdr['splits'][phase]:
+            raise ValueError(f'Seed {seed}: DGCDR/LightGCN {phase} interactions differ; '
+                             'cannot make a paired user comparison')
+    if light['candidates'] != dgcdr['candidates']:
+        raise ValueError(f'Seed {seed}: target candidate item sets differ')
+    if light['repeatable'] != dgcdr['repeatable']:
+        raise ValueError(f'Seed {seed}: evaluation repeatable policies differ')
+    if set(light['results']) != set(dgcdr['results']):
+        raise ValueError(f'Seed {seed}: evaluated target users differ')
+    logging.info('Seed %d: paired splits match (%d train, %d valid, %d test)', seed,
+                 *[len(light['splits'][phase]) for phase in ('train', 'validation', 'test')])
 
 
 def write_csv(spec, out, results):
-    with (out / 'split.pkl').open('rb') as f:
-        payload = pickle.load(f)
-        train, valid, test = payload['loaders']
-    target = train.target_dataset
-    sh, th, eh = histories(train.source_dataset), histories(target), histories(test.dataset)
-    expected = set(eh)
     rows = []
     for seed in spec['seeds']:
-        left, right = results[('LightGCN', seed)], results[('DGCDR', seed)]
-        if set(left) != expected or set(right) != expected:
-            raise ValueError('Incomplete user comparison')
-        for u in sorted(expected):
-            rows.append(dict(user_id=str(target.id2token(target.uid_field, u)), seed=seed,
-                ndcg_lightgcn=left[u][0], ndcg_dgcdr=right[u][0], delta_ndcg=right[u][0]-left[u][0],
-                recall_lightgcn=left[u][1], recall_dgcdr=right[u][1], delta_recall=right[u][1]-left[u][1],
-                n_source_train=len(sh.get(u, set())), n_target_train=len(th[u]), n_test_positives=len(eh[u]),
-                log_activity_ratio=float(np.log((len(sh.get(u, set()))+1)/(len(th[u])+1)))))
+        light, dgcdr = results[('LightGCN', seed)], results[('DGCDR', seed)]
+        for user in sorted(light['results']):
+            left, right = light['results'][user], dgcdr['results'][user]
+            ns = len(dgcdr['source'].get(user, set()))
+            nt = len(dgcdr['target'].get(user, set()))
+            rows.append(dict(user_id=user, seed=seed,
+                ndcg_lightgcn=left[0], ndcg_dgcdr=right[0], delta_ndcg=right[0]-left[0],
+                recall_lightgcn=left[1], recall_dgcdr=right[1], delta_recall=right[1]-left[1],
+                n_source_train=ns, n_target_train=nt,
+                n_test_positives=len(dgcdr['test'][user]),
+                log_activity_ratio=float(np.log((ns+1)/(nt+1)))))
+    if not rows:
+        raise ValueError('No users to compare')
     path = out / 'per_user.csv'
     tmp = path.with_suffix('.tmp')
     with tmp.open('w', newline='') as f:
@@ -323,16 +301,22 @@ def report(spec, out):
     def table(headers, rows):
         return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---']*len(headers)) + '|\n' + ''.join(
             '| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |\n' for row in rows)
-    audit = json.loads((out / 'config.json').read_text())['audit']
-    lines = ['# Transfer: CDs → Instruments\n',
-             '**PROVA BREVE — non risultati conclusivi.**\n' if spec.get('smoke') else 'Esperimento con configurazioni fisse, senza tuning.\n',
-             'Rilevanza = presenza dell’interazione; nessun uso delle stelle. Split 60/20/20 condiviso; '
-             'checkpoint scelto con Recall@20 validation. `repeatable=False` per escludere gli item già osservati '
-             '(override della configurazione originale).\n',
-             'Utenti test: **%d**. Seed: %s. Epsilon: %g.\n' % (n, spec['seeds'], eps),
-             'Split effettivo: %d train, %d validation, %d test. Source: %d interazioni. '
-             '%d item test distinti non hanno archi target train (rimangono candidati per entrambi).\n' % (
-                 audit['target_train'],audit['target_valid'],audit['target_test'],audit['source_train'],audit['test_items_without_train']),
+    audits = json.loads((out / 'config.json').read_text())['seeds']
+    policies = {(a['repeatable'], str(a['threshold_dgcdr']), str(a['threshold_lightgcn']))
+                for a in audits.values()}
+    if len(policies) != 1:
+        raise ValueError('Evaluation or relevance policy varies across seeds')
+    repeatable, threshold_dgcdr, threshold_lightgcn = policies.pop()
+    lines = ['# Transfer: %s → %s\n' % (spec['source'], spec['target']),
+             'Analisi di checkpoint già addestrati; nessun training o tuning.\n',
+             'Ogni coppia DGCDR/LightGCN usa lo stesso split target ricostruito dal seed. '
+             'Gli split possono cambiare fra seed. Checkpoint selezionati in origine con Recall@20 validation. '
+             'repeatable=%s; soglie salvate nei checkpoint: DGCDR %s, LightGCN %s.\n' % (
+                 repeatable, threshold_dgcdr, threshold_lightgcn),
+             'Utenti test distinti: **%d**. Seed: %s. Epsilon: %g.\n' % (n, spec['seeds'], eps),
+             table(['Seed','Train target','Validation target','Test target','Utenti test'], [
+                 [seed, a['train'], a['validation'], a['test'], a['test_users']]
+                 for seed, a in sorted(audits.items(), key=lambda item: int(item[0]))]),
              '## Risultati globali\n',
              table(['Modello', 'NDCG@20', 'Recall@20'], [[name, '%.6f'%summary['ndcg_'+key].mean(),
                  '%.6f'%summary['recall_'+key].mean()] for name,key in [('LightGCN','lightgcn'),('DGCDR','dgcdr')]]),
@@ -362,13 +346,15 @@ def report(spec, out):
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
         '[Risultati completi per utente e seed](per_user.csv).\n',
         '![Distribuzione delle differenze](delta.png)\n',
-        '## Controlli e limiti\nSplit disgiunti; grafi target train-only; maschere train/validation verificate; '
-        'ID condivisi; cinque coppie per utente nelle run complete; metriche individuali confrontate con RecBole. '
-        'Gli intervalli ricampionano utenti mantenendo insieme i seed e sono condizionati allo split e ai modelli osservati. '
-        'Nessuna analisi causale del source; iperparametri non ottimizzati.\n'])
+        '## Controlli e limiti\nPer ogni seed sono stati verificati split target e item candidati identici fra modelli; '
+        'nessuna interazione target di validation/test entra nel grafo train. '
+        'In assenza dei dataloader originali, gli split sono ricostruiti da checkpoint, dataset e seed: '
+        'la coincidenza con il test storico non è dimostrabile dai soli pesi. '
+        'Gli intervalli ricampionano gli utenti e sono condizionati ai seed e split osservati; '
+        'le differenze DGCDR/LightGCN non isolano causalmente l’effetto del source.\n'])
     (out / 'report.md').write_text('\n'.join(lines))
     user_lines = ['# Confronto utenti test\n[Report generale](report.md)\n',
-                  'Metriche medie sui seed; conteggi riferiti al training. [Negative](#negative) · [Neutral](#neutral) · [Positive](#positive)\n']
+                  'Metriche medie sui seed; conteggi medi riferiti al training. [Negative](#negative) · [Neutral](#neutral) · [Positive](#positive)\n']
     for cls in ['Negative','Neutral','Positive']:
         group = summary[summary['class']==cls]
         user_lines.extend(['## '+cls+'\n',table(['Utente','N source','N target','NDCG LGCN','NDCG DGCDR','Delta','Seed negativi','Std delta'],[
@@ -407,15 +393,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=str(ROOT / 'configs/transfer_analysis.yaml'))
     parser.add_argument('--output')
-    parser.add_argument('--stage', choices=['prepare','run','report'], default='run')
-    parser.add_argument('--smoke', action='store_true', help='Two epochs, one seed; separate output')
+    parser.add_argument('--checkpoint-dir', help='Search this directory recursively for model .pth files (default: saved/)')
+    parser.add_argument('--checkpoint', action='append', default=[], metavar='MODEL:SEED=PATH',
+                        help='Explicit model file; repeat for each model/seed. Overrides YAML and discovery.')
+    parser.add_argument('--source', help='Override source dataset name from YAML')
+    parser.add_argument('--target', help='Override target dataset name from YAML')
+    parser.add_argument('--seeds', nargs='+', type=int, default=[2022, 2023, 42, 24, 1])
+    parser.add_argument('--stage', choices=['run','report'], default='run')
     args = parser.parse_args()
     # RecBole parses sys.argv itself; keep this entry point's arguments out of it.
     sys.argv = [sys.argv[0]]
     spec = yaml.safe_load(Path(args.config).read_text())
-    if args.smoke:
-        spec.update(epochs=2, seeds=[2022], smoke=True, bootstrap_samples=100)
-        spec['output'] += '_smoke'
+    spec['seeds'] = args.seeds
+    if args.source or args.target:
+        if not args.output:
+            parser.error('--source/--target requires --output to keep domains separate')
+        spec['source'] = args.source or spec['source']
+        spec['target'] = args.target or spec['target']
     out = Path(args.output or ROOT / spec['output']).resolve()
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(spec['threads'])
@@ -424,13 +418,22 @@ def main():
         saved = json.loads((out/'config.json').read_text())
         report(saved['spec'],out)
         return
-    fingerprint = prepare(spec,out)
-    if args.stage == 'prepare':
-        return
+    paths = checkpoint_paths(spec, args)
     results = {}
+    audits = {}
     for seed in spec['seeds']:
         for name in ['LightGCN','DGCDR']:
-            results[(name,seed)] = run_model(spec,out,fingerprint,name,seed)
+            results[(name,seed)] = reconstruct(spec, out, name, seed, paths[(name, seed)])
+        light, dgcdr = results[('LightGCN', seed)], results[('DGCDR', seed)]
+        compare_pair(seed, light, dgcdr)
+        audits[str(seed)] = dict(train=len(light['splits']['train']),
+                                validation=len(light['splits']['validation']),
+                                test=len(light['splits']['test']), test_users=len(light['results']),
+                                repeatable=light['repeatable'],
+                                threshold_lightgcn=light['threshold'],
+                                threshold_dgcdr=dgcdr['threshold'],
+                                checkpoints={name: str(paths[(name,seed)]) for name in ('LightGCN','DGCDR')})
+    atomic_json(out / 'config.json', dict(spec=spec, seeds=audits))
     write_csv(spec,out,results)
     report(spec,out)
     logging.info('Report ready: %s',out/'report.md')
