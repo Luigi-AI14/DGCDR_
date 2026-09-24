@@ -9,3 +9,6 @@
 /ranking_logs
 *.json
 *.jsonl
+*.pdf
+*.txt
+*.pkl
