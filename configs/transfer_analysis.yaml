@@ -1,0 +1,24 @@
+# Fixed configurations; no hyperparameter search.
+source: AmazonCDs_AmazonInstruments_commonUser_3-core
+target: AmazonInstruments_AmazonCDs_commonUser_3-core
+dataset_config: recbole_cdr/properties/dataset/AmazonCDs_AmazonInstruments_commonUser_3-core.yaml
+output: transfer_results/cds_to_instruments
+split_seed: 2022
+seeds: [2022, 2023, 2024, 2025, 2026]
+epochs: 400
+patience: 10
+train_batch_size: 4096
+eval_batch_size: 131072
+threads: 4
+use_gpu: false
+k: 20
+epsilon: 0.0
+epsilon_grid: [0.0, 0.0001, 0.001, 0.005]
+bootstrap_samples: 2000
+# DGCDR retains its repository model configuration.
+# LightGCN uses RecBole defaults, with explicit fixed values below.
+lightgcn:
+  embedding_size: 64
+  n_layers: 3
+  learning_rate: 0.001
+  reg_weight: 0.00001

@@ -9,3 +9,6 @@
 /ranking_logs
 *.json
 *.jsonl
+# Local transfer experiments and optional plotting runtime
+/transfer_results/
+/.transfer_plotting/
