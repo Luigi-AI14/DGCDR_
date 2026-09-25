@@ -342,15 +342,19 @@ def report(spec, out):
              'nel training di ciascun utente. Per ciascun dominio, i conteggi sono divisi '
              'in base ai terzili: fascia 0 = attività bassa, 1 = media, 2 = alta. '
              'Se due soglie coincidono, le fasce vengono accorpate e possono essere meno di tre. '
-             'La tabella mostra gli intervalli effettivamente osservati per ogni combinazione.\n']
+             'La tabella mostra gli intervalli effettivamente osservati per ogni combinazione. '
+             'Negative e Positive sono le percentuali di utenti nella combinazione con transfer '
+             'rispettivamente negativo e positivo.\n']
     cells = []
     for (s,t), group in summary.groupby(['source_bin','target_bin']):
         neg = group[group['class']=='Negative']
         cells.append([s,t,'%d–%d'%(group.n_source_train.min(), group.n_source_train.max()),
                       '%d–%d'%(group.n_target_train.min(), group.n_target_train.max()), len(group),
                       '%.6f'%group.delta_ndcg.mean(),'%.2f%%'%(100*(group['class']=='Negative').mean()),
+                      '%.2f%%'%(100*(group['class']=='Positive').mean()),
                       '%.6f'%(-neg.delta_ndcg.mean()) if len(neg) else 'n/d'])
-    lines.append(table(['Fascia S','Fascia T','N source','N target','Utenti','Delta','Negative','Perdita negative'],cells))
+    lines.append(table(['Fascia S','Fascia T','N source','N target','Utenti','Delta',
+                        'Negative','Positive','Perdita negative'],cells))
     lines.extend(['## Sensibilità alla soglia\n',table(['Epsilon','Negative','Neutral','Positive'],[
         [e,int((values < -e).sum()),int((np.abs(values)<=e).sum()),int((values>e).sum())] for e in spec['epsilon_grid']]),
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
