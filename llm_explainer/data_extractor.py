@@ -14,6 +14,7 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from recbole.utils import init_seed
 from recbole_cdr.config import CDRConfig
 from recbole_cdr.data import create_dataset
 
@@ -76,6 +77,7 @@ class DataExtractor:
             config_file_list=self.config_info["config_file_list"],
             config_dict={"seed": self.seed},
         )
+        init_seed(self.seed, config["reproducibility"])
         dataset = create_dataset(config)
         built = dataset.build()
 

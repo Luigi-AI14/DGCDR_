@@ -102,7 +102,10 @@ DEFAULT_SETTINGS = {
     "rating_threshold": 4.0,
     "num_users": 5,
     "model_name": "qwen3.5:9b",
+    "sbert_model": "all-MiniLM-L6-v2",
+    "min_review_words": 5,
     "ollama_url": "http://localhost:11434",
     "prompts_dir": os.path.join(BASE_DIR, "saved_prompts"),
     "output_dir": os.path.join(BASE_DIR, "results"),
 }
+

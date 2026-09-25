@@ -6,7 +6,7 @@ Self-contained, mathematically rigorous implementation with graceful edge-case h
 import math
 import re
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def tokenize(text: str) -> List[str]:
@@ -142,9 +142,115 @@ def compute_bleu(
     return float(bleu)
 
 
-def evaluate_explanation_vs_review(candidate_text: str, reference_text: str) -> Dict[str, float]:
+
+_DEFAULT_SBERT_MODEL = None
+
+
+def get_sbert_model(model_name: str = "all-MiniLM-L6-v2") -> Any:
+    """
+    Lazy-loads and caches the Sentence-BERT model (singleton pattern).
+    Uses CUDA if available, falling back gracefully to CPU.
+    """
+    global _DEFAULT_SBERT_MODEL
+    if _DEFAULT_SBERT_MODEL is None:
+        try:
+            import torch
+            from sentence_transformers import SentenceTransformer
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                _DEFAULT_SBERT_MODEL = SentenceTransformer(model_name, device=device)
+            except Exception:
+                # Fallback to CPU if device initialization issues occur
+                _DEFAULT_SBERT_MODEL = SentenceTransformer(model_name, device="cpu")
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers is required for semantic evaluation. "
+                "Install it with 'pip install sentence-transformers'."
+            )
+    return _DEFAULT_SBERT_MODEL
+
+
+def format_reference_with_title(review_text: str, review_title: Optional[str] = None) -> str:
+    """
+    Combines user review title and review body text into a coherent sentence/paragraph
+    for semantic embedding comparison.
+    """
+    title = (review_title or "").strip()
+    text = (review_text or "").strip()
+    if title and text:
+        if title[-1] in ".!?,:;":
+            return f"{title} {text}"
+        return f"{title}. {text}"
+    elif title:
+        return title
+    return text
+
+
+def compute_sbert_similarity(
+    candidate_text: str,
+    reference_text: str,
+    model: Optional[Any] = None,
+) -> float:
+    """
+    Computes cosine similarity between candidate explanation and reference review.
+    Returns:
+        similarity: float in [-1.0, 1.0] (typically [0.0, 1.0] for topical text).
+    """
+    cand = candidate_text.strip() if candidate_text else ""
+    ref = reference_text.strip() if reference_text else ""
+
+    if not cand or not ref:
+        return 0.0
+
+    if model is None:
+        model = get_sbert_model()
+
+    import numpy as np
+
+    embs = model.encode([cand, ref], normalize_embeddings=True, show_progress_bar=False)
+    sim = float(np.dot(embs[0], embs[1]))
+    return round(float(sim), 4)
+
+
+def batch_compute_sbert_similarity(
+    candidate_texts: List[str],
+    reference_texts: List[str],
+    model: Optional[Any] = None,
+    batch_size: int = 64,
+) -> List[float]:
+    """
+    Batch computes cosine similarities between pairs of candidates and references.
+    """
+    if not candidate_texts or not reference_texts:
+        return []
+
+    if len(candidate_texts) != len(reference_texts):
+        raise ValueError("candidate_texts and reference_texts must have the same length.")
+
+    if model is None:
+        model = get_sbert_model()
+
+    import numpy as np
+
+    cand_embs = model.encode(candidate_texts, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False)
+    ref_embs = model.encode(reference_texts, batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False)
+
+    sims = np.sum(cand_embs * ref_embs, axis=1)
+    return [round(float(s), 4) for s in sims]
+
+
+def evaluate_explanation_vs_review(
+    candidate_text: str,
+    reference_text: str,
+    reference_title: Optional[str] = None,
+    sbert_model: Optional[Any] = None,
+) -> Dict[str, float]:
     """
     Evaluate candidate explanation against ground-truth user review.
+    Computes syntactic metrics (BLEU, ROUGE-1, ROUGE-2, ROUGE-L) and semantic
+    similarity via Sentence-BERT (incorporating the review title).
+
     Returns:
         bleu: float
         rouge1_f1: float
@@ -156,6 +262,7 @@ def evaluate_explanation_vs_review(candidate_text: str, reference_text: str) -> 
         rougeL_f1: float
         rougeL_p: float
         rougeL_r: float
+        sbert_similarity: float
     """
     cand_tokens = tokenize(candidate_text)
     ref_tokens = tokenize(reference_text)
@@ -164,6 +271,10 @@ def evaluate_explanation_vs_review(candidate_text: str, reference_text: str) -> 
     r2 = compute_rouge_n(cand_tokens, ref_tokens, n=2)
     rl = compute_rouge_l(cand_tokens, ref_tokens)
     bleu = compute_bleu(cand_tokens, ref_tokens)
+
+    # Prepare semantic comparison text (including review title)
+    semantic_ref = format_reference_with_title(reference_text, reference_title)
+    sbert_sim = compute_sbert_similarity(candidate_text, semantic_ref, model=sbert_model)
 
     return {
         "bleu": round(bleu, 4),
@@ -176,4 +287,6 @@ def evaluate_explanation_vs_review(candidate_text: str, reference_text: str) -> 
         "rougeL_f1": round(rl["f1"], 4),
         "rougeL_p": round(rl["precision"], 4),
         "rougeL_r": round(rl["recall"], 4),
+        "sbert_similarity": round(sbert_sim, 4),
     }
+
