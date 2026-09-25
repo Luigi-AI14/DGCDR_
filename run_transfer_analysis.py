@@ -91,7 +91,7 @@ def checkpoint_config(state, path, model, seed, spec, out):
             config[domain + '_domain']['data_path'] = str(ROOT / 'dataset' / name)
     else:
         config['data_path'] = str(ROOT / 'dataset' / target)
-    config['use_gpu'] = bool(spec.get('use_gpu', False))
+    config['use_gpu'] = bool(spec.get('use_gpu', True))
     config['device'] = torch.device('cuda' if config['use_gpu'] and torch.cuda.is_available() else 'cpu')
     config['checkpoint_dir'] = str(out / '_no_saved_dataloaders' / model / str(seed))
     config['dataloaders_save_path'] = None
@@ -405,6 +405,12 @@ def main():
         saved = json.loads((out/'config.json').read_text(encoding='utf-8'))
         report(saved['spec'],out)
         return
+    if spec.get('use_gpu', True) and torch.cuda.is_available():
+        logging.info('Evaluation device: %s (%s)', torch.device('cuda'), torch.cuda.get_device_name())
+    elif spec.get('use_gpu', True):
+        logging.warning('CUDA unavailable; falling back to CPU for evaluation')
+    else:
+        logging.info('Evaluation device: CPU')
     paths = checkpoint_paths(spec, args)
     results = {}
     audits = {}
