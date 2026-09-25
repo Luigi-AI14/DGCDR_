@@ -16,7 +16,6 @@ import argparse
 import csv
 import json
 import logging
-import os
 from pathlib import Path
 import sys
 
@@ -37,12 +36,6 @@ CHECKPOINT_OVERRIDES = {
     # 'DGCDR': {2022: '/absolute/path/to/DGCDR-checkpoint.pth'},
     # 'LightGCN': {2022: '/absolute/path/to/LightGCN-checkpoint.pth'},
 }
-# Optional plotting dependencies installed locally; leave the training environment unchanged.
-if (ROOT / '.transfer_plotting').exists():
-    sys.path.append(str(ROOT / '.transfer_plotting'))
-os.environ.setdefault('MPLCONFIGDIR', str(ROOT / 'transfer_results/.matplotlib'))
-
-
 def atomic_json(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(value, indent=2, default=str) + '\n', encoding='utf-8')
@@ -285,9 +278,6 @@ def write_csv(spec, out, results):
 
 def report(spec, out):
     import pandas as pd
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
     df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
     if df.duplicated(['user_id', 'seed']).any() or not df.groupby('user_id').seed.apply(
             lambda s: set(s) == set(spec['seeds'])).all():
@@ -322,16 +312,18 @@ def report(spec, out):
     if len(policies) != 1:
         raise ValueError('Evaluation or relevance policy varies across seeds')
     repeatable, threshold_dgcdr, threshold_lightgcn = policies.pop()
+    def audit_counts(field):
+        return ', '.join(str(value) for value in sorted({a[field] for a in audits.values()}))
     lines = ['# Transfer: %s → %s\n' % (spec['source'], spec['target']),
              'Analisi di checkpoint già addestrati; nessun training o tuning.\n',
              'Ogni coppia DGCDR/LightGCN usa lo stesso split target ricostruito dal seed. '
              'Gli split possono cambiare fra seed. Checkpoint selezionati in origine con Recall@20 validation. '
              'repeatable=%s; soglie salvate nei checkpoint: DGCDR %s, LightGCN %s.\n' % (
                  repeatable, threshold_dgcdr, threshold_lightgcn),
-             'Utenti test distinti: **%d**. Seed: %s. Epsilon: %g.\n' % (n, spec['seeds'], eps),
-             table(['Seed','Train target','Validation target','Test target','Utenti test'], [
-                 [seed, a['train'], a['validation'], a['test'], a['test_users']]
-                 for seed, a in sorted(audits.items(), key=lambda item: int(item[0]))]),
+             'Train target: **%s**. Validation target: **%s**. Test target: **%s**. '
+             'Utenti test distinti: **%d**. Seed: %s. Epsilon: %g.\n' % (
+                 audit_counts('train'), audit_counts('validation'), audit_counts('test'),
+                 n, spec['seeds'], eps),
              '## Risultati globali\n',
              table(['Modello', 'NDCG@20', 'Recall@20'], [[name, '%.6f'%summary['ndcg_'+key].mean(),
                  '%.6f'%summary['recall_'+key].mean()] for name,key in [('LightGCN','lightgcn'),('DGCDR','dgcdr')]]),
@@ -346,8 +338,11 @@ def report(spec, out):
              '## Variabilità fra seed\n',
              table(['Seed','NDCG LightGCN','NDCG DGCDR','Delta'], [[seed, *['%.6f'%v for v in group[
                  ['ndcg_lightgcn','ndcg_dgcdr','delta_ndcg']].mean()]] for seed,group in df.groupby('seed')]),
-             '## Attività source × target\nLe fasce 0/1/2 derivano dai terzili dei conteggi train; '
-             'soglie coincidenti vengono unite. Gli intervalli osservati sono indicati in tabella.\n']
+             '## Attività source × target\nN source e N target sono i numeri di interazioni '
+             'nel training di ciascun utente. Per ciascun dominio, i conteggi sono divisi '
+             'in base ai terzili: fascia 0 = attività bassa, 1 = media, 2 = alta. '
+             'Se due soglie coincidono, le fasce vengono accorpate e possono essere meno di tre. '
+             'La tabella mostra gli intervalli effettivamente osservati per ogni combinazione.\n']
     cells = []
     for (s,t), group in summary.groupby(['source_bin','target_bin']):
         neg = group[group['class']=='Negative']
@@ -360,7 +355,6 @@ def report(spec, out):
         [e,int((values < -e).sum()),int((np.abs(values)<=e).sum()),int((values>e).sum())] for e in spec['epsilon_grid']]),
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
         '[Risultati completi per utente e seed](per_user.csv).\n',
-        '![Distribuzione delle differenze](delta.png)\n',
         '## Controlli e limiti\nPer ogni seed sono stati verificati split target e item candidati identici fra modelli; '
         'nessuna interazione target di validation/test entra nel grafo train. '
         'In assenza dei dataloader originali, gli split sono ricostruiti da checkpoint, dataset e seed: '
@@ -369,8 +363,8 @@ def report(spec, out):
         'le differenze DGCDR/LightGCN non isolano causalmente l’effetto del source.\n'])
     (out / 'report.md').write_text('\n'.join(lines), encoding='utf-8')
     user_lines = ['# Confronto utenti test\n[Report generale](report.md)\n',
-                  'Metriche medie sui seed; conteggi medi riferiti al training. [Negative](#negative) · [Neutral](#neutral) · [Positive](#positive)\n']
-    for cls in ['Negative','Neutral','Positive']:
+                  'Metriche medie sui seed; conteggi medi riferiti al training. [Negative](#negative) · [Positive](#positive) · [Neutral](#neutral)\n']
+    for cls in ['Negative','Positive','Neutral']:
         group = summary[summary['class']==cls]
         user_lines.extend(['## '+cls+'\n',table(['Utente','N source','N target','NDCG LGCN','NDCG DGCDR','Delta','Seed negativi','Std delta'],[
             [u,int(r.n_source_train),int(r.n_target_train),'%.6f'%r.ndcg_lightgcn,'%.6f'%r.ndcg_dgcdr,
@@ -378,30 +372,8 @@ def report(spec, out):
             '### Recall — '+cls+'\n', table(['Utente','Recall LGCN','Recall DGCDR','Delta'],[
                 [u,'%.6f'%r.recall_lightgcn,'%.6f'%r.recall_dgcdr,'%.6f'%r.delta_recall] for u,r in group.iterrows()])])
     (out / 'users.md').write_text('\n'.join(user_lines), encoding='utf-8')
-    fig, ax = plt.subplots(figsize=(8,4))
-    ax.hist(values, bins=50, color='#4878a8')
-    ax.axvline(0,color='black',linewidth=1)
-    ax.set(xlabel='Delta medio NDCG@20 (DGCDR − LightGCN)',ylabel='Utenti')
-    fig.tight_layout()
-    fig.savefig(out / 'delta.png',dpi=160)
-    plt.close(fig)
-    for field, filename, label in [('delta_ndcg','activity_delta.png','Delta medio NDCG@20'),
-                                    ('negative_fraction','activity_negative.png','Quota negative')]:
-        temp = summary.assign(negative_fraction=(summary['class']=='Negative').astype(float))
-        grid = temp.pivot_table(index='source_bin',columns='target_bin',values=field,aggfunc='mean')
-        fig, ax = plt.subplots(figsize=(5,4))
-        im = ax.imshow(grid.to_numpy(), cmap='coolwarm' if field=='delta_ndcg' else 'Reds')
-        for row in range(len(grid)):
-            for col in range(len(grid.columns)):
-                ax.text(col,row,'%.3f'%grid.iloc[row,col],ha='center',va='center')
-        ax.set(xticks=range(len(grid.columns)),xticklabels=grid.columns,yticks=range(len(grid)),
-               yticklabels=grid.index,xlabel='Fascia attività target',ylabel='Fascia attività source',title=label)
-        fig.colorbar(im, ax=ax)
-        fig.tight_layout()
-        fig.savefig(out / filename,dpi=160)
-        plt.close(fig)
-    with (out / 'report.md').open('a', encoding='utf-8') as f:
-        f.write('\n![Delta per attività](activity_delta.png)\n\n![Negative per attività](activity_negative.png)\n')
+    for old_plot in ('delta.png', 'activity_delta.png', 'activity_negative.png'):
+        (out / old_plot).unlink(missing_ok=True)
 
 
 def main():
