@@ -276,6 +276,76 @@ def write_csv(spec, out, results):
     tmp.replace(path)
 
 
+def activity_distribution(summary, out):
+    """Plot both domains with common count intervals and retain exact frequencies."""
+    import pandas as pd
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.ticker import FuncFormatter
+
+    bounds = [-np.inf, 5, 10, 20, np.inf]
+    labels = ['0 ≤ N ≤ 5', '5 < N ≤ 10', '10 < N ≤ 20', 'N > 20']
+    n = len(summary)
+    grouped = {}
+    detailed = []
+    for domain in ('source', 'target'):
+        activity = summary['n_%s_train' % domain]
+        if not np.isfinite(activity).all() or (activity < 0).any():
+            raise ValueError('Invalid training activity for ' + domain)
+        grouped[domain] = (pd.cut(activity, bounds, labels=labels, right=True)
+                           .value_counts(sort=False).reindex(labels, fill_value=0))
+        counts = activity.value_counts().sort_index()
+        detailed.extend(dict(domain=domain, n_train_mean=value, users=int(count),
+                             percent=100 * count / n) for value, count in counts.items())
+    pd.DataFrame(detailed).to_csv(out / 'activity_distribution.csv', index=False)
+
+    fig = Figure(figsize=(11, 4.8), layout='constrained', facecolor='white')
+    FigureCanvasAgg(fig)
+    ax = fig.subplots()
+    positions = np.arange(len(labels))
+    maximum = max(int(counts.max()) for counts in grouped.values())
+    for domain, offset, color in [('source', -.19, '#2563a6'), ('target', .19, '#df8031')]:
+        counts = grouped[domain].to_numpy()
+        bars = ax.barh(positions + offset, counts, height=.34,
+                       label=domain.capitalize(), color=color)
+        for bar, count in zip(bars, counts):
+            ax.text(count + maximum * .012, bar.get_y() + bar.get_height() / 2,
+                    ('%.2f%%' % (100 * count / n)).replace('.', ','),
+                    va='center', fontsize=9, color='#334155')
+    ax.set_yticks(positions, labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0, maximum * 1.2)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f'{value:,.0f}'.replace(',', '.')))
+    ax.set_xlabel('Numero di utenti')
+    ax.set_ylabel('Interazioni di training (N)')
+    ax.set_title('Conteggi medi sui seed · %s utenti per dominio\n'
+                 'Intervalli uguali per source e target; etichette = percentuale di utenti'
+                 % f'{n:,}'.replace(',', '.'), fontsize=10, loc='left', pad=16)
+    fig.suptitle('Distribuzione degli utenti per attività', fontsize=17, fontweight='bold')
+    ax.legend(loc='lower right', frameon=False)
+    ax.set_axisbelow(True)
+    ax.grid(axis='x', color='#e2e8f0')
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(axis='both', length=0)
+    fig.savefig(out / 'activity_distribution.png', dpi=180)
+    return grouped
+
+
+def activity_bin_labels(values, cuts):
+    """Describe global bin boundaries, with inclusive bounds for integer counts."""
+    integer_counts = np.equal(values, np.floor(values)).all()
+    limits = [str(int(np.floor(cut))) if integer_counts else
+              np.format_float_positional(float(cut), trim='-') for cut in cuts]
+    labels = ['N ≤ ' + limits[0]]
+    for lower, upper in zip(limits[:-1], limits[1:]):
+        labels.append(f'{int(lower) + 1} ≤ N ≤ {upper}' if integer_counts else
+                      f'{lower} < N ≤ {upper}')
+    labels.append(f'N ≥ {int(limits[-1]) + 1}' if integer_counts else
+                  'N > ' + limits[-1])
+    return labels
+
+
 def report(spec, out):
     import pandas as pd
     df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
@@ -290,10 +360,12 @@ def report(spec, out):
     summary['class'] = np.where(summary.delta_ndcg > eps, 'Positive',
                         np.where(summary.delta_ndcg < -eps, 'Negative', 'Neutral'))
     summary['both_zero'] = g.apply(lambda x: bool(((x.ndcg_dgcdr == 0) & (x.ndcg_lightgcn == 0)).all()))
+    bin_labels = {}
     for domain in ('source', 'target'):
         values = summary['n_%s_train' % domain]
         cuts = np.unique(np.quantile(values, [1/3, 2/3]))
         summary[domain + '_bin'] = np.searchsorted(cuts, values, side='left')
+        bin_labels[domain] = activity_bin_labels(values, cuts)
     summary = summary.sort_values(['delta_ndcg'], kind='stable')
     n = len(summary)
     rng = np.random.RandomState(2022)
@@ -337,26 +409,47 @@ def report(spec, out):
                  ('%.6f' % -summary.loc[summary['class']=='Negative','delta_ndcg'].mean()) if (summary['class']=='Negative').any() else 'n/d'),
              '## Variabilità fra seed\n',
              table(['Seed','NDCG LightGCN','NDCG DGCDR','Delta'], [[seed, *['%.6f'%v for v in group[
-                 ['ndcg_lightgcn','ndcg_dgcdr','delta_ndcg']].mean()]] for seed,group in df.groupby('seed')]),
-             '## Attività source × target\nN source e N target sono i numeri di interazioni '
-             'nel training di ciascun utente. Per ciascun dominio, i conteggi sono divisi '
+                 ['ndcg_lightgcn','ndcg_dgcdr','delta_ndcg']].mean()]] for seed,group in df.groupby('seed')])]
+    grouped_activity = activity_distribution(summary, out)
+    lines.extend(['## Distribuzione delle interazioni per dominio\n',
+                  'Il grafico e le tabelle considerano gli stessi utenti test inclusi nel confronto. '
+                  'Per ogni utente si usa il numero di interazioni distinte nel training, '
+                  'mediato sui seed, come per la suddivisione in fasce. Ogni utente è contato '
+                  'una sola volta in ciascun dominio. Gli intervalli sono fissi e uguali per '
+                  'source e target; includono le eventuali medie decimali secondo i limiti indicati. '
+                  'Questi intervalli descrittivi sono distinti dalle fasce a terzili della sezione successiva. '
+                  'Le barre mostrano il numero di utenti per intervallo; le percentuali sono riferite '
+                  'al totale degli utenti analizzati.\n',
+                  '![Distribuzione utenti source e target per intervalli comuni di interazioni]'
+                  '(activity_distribution.png)\n',
+                  '[Distribuzione completa per singolo valore (CSV)](activity_distribution.csv).\n'])
+    for domain in ('source', 'target'):
+        counts = grouped_activity[domain]
+        distribution = [[interval, int(count),
+                         '%.2f%%' % (100 * count / n)]
+                        for interval, count in counts.items()]
+        distribution.append(['Totale', n, '100.00%'])
+        lines.extend(['### Dominio %s — %s\n' % (domain, spec[domain]),
+                      table(['Interazioni train (media sui seed)', 'Utenti', 'Percentuale'],
+                            distribution)])
+    lines.append('## Attività source × target\nN source e N target sono i numeri di interazioni '
+             'nel training di ciascun utente, mediati sui seed. Per ciascun dominio, i conteggi sono divisi '
              'in base ai terzili: fascia 0 = attività bassa, 1 = media, 2 = alta. '
              'Se due soglie coincidono, le fasce vengono accorpate e possono essere meno di tre. '
-             'La tabella mostra gli intervalli effettivamente osservati per ogni combinazione. '
+             'La tabella mostra le soglie globali che definiscono ciascuna fascia: '
+             'rimangono uguali in tutte le combinazioni e la fascia più alta non ha un limite superiore. '
              'Negative e Positive sono le percentuali di utenti nella combinazione con transfer '
-             'rispettivamente negativo e positivo.\n']
+             'rispettivamente negativo e positivo.\n')
     cells = []
     for (s,t), group in summary.groupby(['source_bin','target_bin']):
         neg = group[group['class']=='Negative']
-        cells.append([s,t,'%d–%d'%(group.n_source_train.min(), group.n_source_train.max()),
-                      '%d–%d'%(group.n_target_train.min(), group.n_target_train.max()), len(group),
+        cells.append([s,t,bin_labels['source'][s],bin_labels['target'][t],len(group),
                       '%.6f'%group.delta_ndcg.mean(),'%.2f%%'%(100*(group['class']=='Negative').mean()),
                       '%.2f%%'%(100*(group['class']=='Positive').mean()),
                       '%.6f'%(-neg.delta_ndcg.mean()) if len(neg) else 'n/d'])
     lines.append(table(['Fascia S','Fascia T','N source','N target','Utenti','Delta',
                         'Negative','Positive','Perdita negative'],cells))
-    lines.extend(['## Sensibilità alla soglia\n',table(['Epsilon','Negative','Neutral','Positive'],[
-        [e,int((values < -e).sum()),int((np.abs(values)<=e).sum()),int((values>e).sum())] for e in spec['epsilon_grid']]),
+    lines.extend([
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
         '[Risultati completi per utente e seed](per_user.csv).\n',
         '## Controlli e limiti\nPer ogni seed sono stati verificati split target e item candidati identici fra modelli; '
