@@ -95,7 +95,14 @@ def parse_args():
 
 
 def find_latest_results_file(results_dir: str) -> Optional[str]:
-    files = glob.glob(os.path.join(results_dir, "validation_*.json"))
+    all_files = glob.glob(os.path.join(results_dir, "**", "*.json"), recursive=True)
+    files = [
+        f for f in all_files
+        if not os.path.basename(f).startswith("compact_")
+        and "_legacy_archive" not in os.path.normpath(f)
+    ]
+    if not files:
+        files = [f for f in all_files if not os.path.basename(f).startswith("compact_")]
     if not files:
         return None
     files.sort(key=os.path.getmtime, reverse=True)
@@ -348,6 +355,15 @@ def evaluate_results(
     with open(save_target, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+    # Generate companion Markdown report in the same directory
+    base_md, _ = os.path.splitext(save_target)
+    save_md_target = f"{base_md}.md"
+    try:
+        from llm_explainer.markdown_exporter import generate_markdown_report
+        generate_markdown_report(data, save_md_target)
+    except Exception as e:
+        logger.warning(f"Could not generate companion markdown report: {e}")
+
     # Print Report
     print("\n" + "=" * 95)
     print(" VALIDATION RESULTS SUMMARY")
@@ -361,7 +377,8 @@ def evaluate_results(
     print(f"Macro Average ROUGE-2 (F1):      {macro_r2:.4f}")
     print(f"Macro Average ROUGE-L (F1):      {macro_rl:.4f}")
     print(f"Macro Average SBERT Sim:         {macro_sbert:.4f}")
-    print(f"Saved Enriched Results:          {save_target}")
+    print(f"Saved Enriched Results (JSON):   {save_target}")
+    print(f"Saved Enriched Results (MD):     {save_md_target}")
     print("=" * 95)
 
     print("\n" + "=" * 95)

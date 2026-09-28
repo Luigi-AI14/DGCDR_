@@ -13,14 +13,18 @@ DGCDR_/
 │   ├── config.py             # Domain pairs, file paths, default parameters
 │   ├── metrics.py            # Sentence BLEU (smoothing) & ROUGE-1/2/L (P, R, F1)
 │   ├── ollama_client.py      # Ollama REST client (supports Qwen 3.5 9B with 16k context)
+│   ├── markdown_exporter.py  # Markdown report exporter and results organizer
 │   ├── prompt_builder.py     # Prompt formatter in English + prompt file writer
 │   ├── data_extractor.py     # RecBole split loader (seed 42), text filter, instant cache loader
 │   └── compact_builder.py    # Preprocessor for lightweight compact metadata & reviews
 ├── saved_prompts/            # Saved prompts organized into subfolders per validation run
-│   └── prompt_<result_json_basename>/
+│   └── prompt_<domain_pair>_<model>_<timestamp>/
 │       └── prompt_<user_id>.txt
-├── results/                  # Detailed validation JSON reports
-│   └── validation_<domain_pair>_<N>users_<timestamp>.json
+├── results/                  # Validation reports partitioned by domain pair and LLM
+│   └── <domain_pair>/        # e.g., Cloth-Elec/
+│       └── <model_name>/     # e.g., llama3.1_8b/, qwen3.5_9b/
+│           ├── <source>-<target>_<model>_<timestamp>.json
+│           └── <source>-<target>_<model>_<timestamp>.md
 ├── cache/                    # Compact dataset caches (compact_<pair>.pkl & compact_<pair>.json)
 ├── preprocess_compact_data.py # CLI script to build compact datasets (< 1s load time)
 ├── run_llm_validation.py     # Main CLI entry point
@@ -103,7 +107,12 @@ Each prompt includes:
 - **Recommended Items**: 20% target domain held-out items presented blindly as recommendations from DGCDR.
 - **Strict English Instructions & JSON Schema**.
 
-### 2. Validation Report (`results/validation_*.json`)
+### 2. Validation Reports (`results/<domain_pair>/<source>-<target>_<model>_<timestamp>.json` and `.md`)
+Every run automatically produces both a structured `.json` file and a human-readable companion `.md` (Markdown) report in the domain-specific subdirectory:
+- **`results/<domain_pair>/<filename>.json`**: Full raw metrics, item-level evaluations, user averages, and quintile stratifications.
+- **`results/<domain_pair>/<filename>.md`**: Formatted summary tables (global macro averages, review quintiles, user breakdowns) and styled item-by-item comparison cards.
+
+Sample JSON snippet:
 ```json
 {
   "timestamp": "2026-09-24T11:00:42.251",

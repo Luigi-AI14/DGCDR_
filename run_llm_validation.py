@@ -23,6 +23,7 @@ from recbole.utils import init_seed
 
 from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
 from llm_explainer.data_extractor import DataExtractor
+from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
 from llm_explainer.metrics import evaluate_explanation_vs_review, get_sbert_model
 from llm_explainer.ollama_client import OllamaClient
 from llm_explainer.prompt_builder import build_user_prompt
@@ -119,6 +120,12 @@ def parse_args():
         help="Whether to include review title in quintile word count classification.",
     )
     parser.add_argument(
+        "--num_ctx",
+        type=int,
+        default=DEFAULT_SETTINGS.get("num_ctx", 32768),
+        help="Ollama context window size num_ctx (default: 32768).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
@@ -132,7 +139,7 @@ def main():
     init_seed(args.seed, reproducibility=True)
 
     print("=" * 80)
-    print(" DGCDR EXPLANATION & VALIDATION PIPELINE (Qwen 3.5 9B)")
+    print(" DGCDR EXPLANATION & VALIDATION PIPELINE ")
     print("=" * 80)
     print(f"Domain Pair:         {args.domain_pair}")
     print(f"Number of Users:     {args.num_users}")
@@ -141,6 +148,7 @@ def main():
     print(f"Rating Threshold:    >= {args.rating_threshold}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
+    print(f"Context Window:      {args.num_ctx} tokens")
     print(f"Quintile Min Words:  >= {args.min_review_words} words (excluding < {args.min_review_words})")
     print(f"Use Title in Q-Word: {args.use_title_in_quintiles}")
     print(f"Prompts Directory:   {args.prompts_dir}")
@@ -156,6 +164,8 @@ def main():
         model=args.model,
         temperature=args.temperature,
         seed=args.seed,
+        num_ctx=args.num_ctx,
+        think=False,
     )
     if not args.dry_run:
         logger.info(f"Checking Ollama server connectivity at {args.ollama_url}...")
@@ -191,10 +201,18 @@ def main():
         sys.exit(1)
 
     # Prepare output filenames and dedicated run prompt directory
+    # Format: "dominio source"-"dominio target"_"Nome LLM"_"data e ora" (e.g. Cloth-Elec_qwen3.5_9b_20260926_120411)
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_basename = f"validation_{args.domain_pair}_{len(users_data)}users_{run_timestamp}"
+    clean_model = sanitize_model_name(args.model)
+    output_basename = f"{args.domain_pair}_{clean_model}_{run_timestamp}"
     output_filename = f"{output_basename}.json"
-    output_filepath = os.path.join(args.output_dir, output_filename)
+    md_filename = f"{output_basename}.md"
+
+    # Separate results into domain-pair and model subfolders (e.g. results/Cloth-Elec/qwen3.5_9b/)
+    domain_model_output_dir = os.path.join(args.output_dir, args.domain_pair, clean_model)
+    os.makedirs(domain_model_output_dir, exist_ok=True)
+    output_filepath = os.path.join(domain_model_output_dir, output_filename)
+    md_filepath = os.path.join(domain_model_output_dir, md_filename)
 
     run_prompts_dir = os.path.join(args.prompts_dir, f"prompt_{output_basename}")
     os.makedirs(run_prompts_dir, exist_ok=True)
@@ -435,6 +453,9 @@ def main():
     with open(output_filepath, "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
 
+    # Generate companion Markdown report in the same domain directory
+    generate_markdown_report(final_report, md_filepath)
+
     print("\n" + "=" * 95)
     print(" VALIDATION RESULTS SUMMARY")
     print("=" * 95)
@@ -446,6 +467,7 @@ def main():
     print(f"Macro Average ROUGE-L (F1):      {macro_rl:.4f}")
     print(f"Macro Average SBERT Similarity:  {macro_sbert:.4f}")
     print(f"Saved Results JSON:              {output_filepath}")
+    print(f"Saved Results Markdown:          {md_filepath}")
     print(f"Saved Prompts Directory:         {run_prompts_dir}")
     print("=" * 95)
 

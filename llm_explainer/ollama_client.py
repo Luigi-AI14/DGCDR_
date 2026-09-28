@@ -22,12 +22,16 @@ class OllamaClient:
         temperature: float = 0.0,
         seed: int = 42,
         timeout: int = 300,
+        num_ctx: int = 32768,
+        think: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.seed = seed
         self.timeout = timeout
+        self.num_ctx = num_ctx
+        self.think = think
 
     def check_health(self) -> bool:
         """Check if Ollama server is running and accessible."""
@@ -72,10 +76,11 @@ class OllamaClient:
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
+            "think": self.think,
             "options": {
                 "temperature": self.temperature,
                 "seed": self.seed,
-                "num_ctx": 16384,
+                "num_ctx": self.num_ctx,
                 "num_predict": 4096,
             },
         }
@@ -91,6 +96,10 @@ class OllamaClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
+                if resp_data.get("done_reason") == "length":
+                    logger.warning(
+                        "Ollama response generation was truncated due to context window limit (done_reason='length')!"
+                    )
                 message = resp_data.get("message", {})
                 raw_response = message.get("content", "")
                 if not raw_response and "response" in resp_data:
