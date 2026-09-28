@@ -28,6 +28,7 @@ from recbole.model.general_recommender.lightgcn import LightGCN
 from recbole.utils import init_seed
 from recbole_cdr.data import create_dataset, data_preparation
 from recbole_cdr.model.cross_domain_recommender.dgcdr import DGCDR
+from transfer_statistics_test import global_paired_ttest, validate_ndcg_values
 
 ROOT = Path(__file__).resolve().parent
 # Defaults can be edited here; command-line options and YAML entries override them.
@@ -346,20 +347,29 @@ def activity_bin_labels(values, cuts):
     return labels
 
 
+def transfer_classes(lightgcn, dgcdr):
+    """Classify NDCG changes using a fixed inclusive 1% relative threshold."""
+    delta = dgcdr - lightgcn
+    return np.select(
+        [(lightgcn == 0) & (dgcdr == 0),
+         delta >= 0.01 * lightgcn, delta <= -0.01 * lightgcn],
+        ['NDCG@20 nullo', 'Positive', 'Negative'], default='Neutral')
+
+
 def report(spec, out):
     import pandas as pd
     df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
     if df.duplicated(['user_id', 'seed']).any() or not df.groupby('user_id').seed.apply(
             lambda s: set(s) == set(spec['seeds'])).all():
         raise ValueError('Missing or duplicated seed results')
+    df['ndcg_dgcdr'] = validate_ndcg_values(df['ndcg_dgcdr'], 'DGCDR')
+    df['ndcg_lightgcn'] = validate_ndcg_values(df['ndcg_lightgcn'], 'LightGCN')
     g = df.groupby('user_id', sort=True)
     summary = g.mean(numeric_only=True)
-    eps = spec['epsilon']
-    summary['negative_seeds'] = g.delta_ndcg.apply(lambda x: int((x < -eps).sum()))
+    seed_classes = pd.Series(transfer_classes(df.ndcg_lightgcn, df.ndcg_dgcdr), index=df.index)
+    summary['negative_seeds'] = seed_classes.eq('Negative').groupby(df.user_id).sum()
     summary['std_delta'] = g.delta_ndcg.std().fillna(0)
-    summary['class'] = np.where(summary.delta_ndcg > eps, 'Positive',
-                        np.where(summary.delta_ndcg < -eps, 'Negative', 'Neutral'))
-    summary['both_zero'] = g.apply(lambda x: bool(((x.ndcg_dgcdr == 0) & (x.ndcg_lightgcn == 0)).all()))
+    summary['class'] = transfer_classes(summary.ndcg_lightgcn, summary.ndcg_dgcdr)
     bin_labels = {}
     for domain in ('source', 'target'):
         values = summary['n_%s_train' % domain]
@@ -368,16 +378,41 @@ def report(spec, out):
         bin_labels[domain] = activity_bin_labels(values, cuts)
     summary = summary.sort_values(['delta_ndcg'], kind='stable')
     n = len(summary)
-    rng = np.random.RandomState(2022)
-    boot = []
-    values = summary.delta_ndcg.to_numpy()
-    for _ in range(spec['bootstrap_samples']):
-        v = values[rng.randint(0, n, n)]
-        boot.append([v.mean(), (v < -eps).mean(), (v > eps).mean()])
-    ci = np.quantile(boot, [.025, .975], axis=0)
+    paired_test = global_paired_ttest(summary.ndcg_dgcdr.to_numpy(),
+                                      summary.ndcg_lightgcn.to_numpy())
+    classification_note = (
+        'La classe di ciascun utente è definita sui suoi NDCG@20 medi sui seed.\n\n'
+        '- **Negative:** peggioramento di DGCDR di almeno l’1% rispetto a LightGCN.\n'
+        '- **Positive:** miglioramento di DGCDR di almeno l’1% rispetto a LightGCN; '
+        'include il caso LightGCN = 0 e DGCDR > 0, per il quale la percentuale individuale non è definita.\n'
+        '- **Neutral:** variazione relativa strettamente compresa tra −1% e +1%, con LightGCN > 0.\n'
+        '- **NDCG@20 nullo:** NDCG@20 pari a zero per entrambi i modelli.\n')
     def table(headers, rows):
         return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---']*len(headers)) + '|\n' + ''.join(
             '| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |\n' for row in rows)
+    test_rows = [['Utenti confrontati', paired_test.n],
+                 ['Delta medio (punti NDCG)',
+                  '%.6f' % paired_test.mean_delta if paired_test.mean_delta is not None else 'n/d']]
+    if paired_test.reason:
+        test_rows.extend([['IC 95% del Delta medio', 'n/d'],
+                          ['Statistica t', 'n/d'],
+                          ['Gradi di libertà', 'n/d'],
+                          ['p-value bilaterale', 'n/d']])
+        test_conclusion = 'Test non calcolabile: %s.' % paired_test.reason
+    else:
+        pvalue_text = ('< 1e-300' if paired_test.pvalue == 0
+                       else '%.2e' % paired_test.pvalue)
+        test_rows.extend([['IC 95% del Delta medio', '[%.6f, %.6f]' % (
+                              paired_test.ci_low, paired_test.ci_high)],
+                          ['Statistica t', '%.4f' % paired_test.statistic],
+                          ['Gradi di libertà', paired_test.degrees_of_freedom],
+                          ['p-value bilaterale', pvalue_text]])
+        if paired_test.pvalue < 0.05:
+            winner = 'DGCDR' if paired_test.mean_delta > 0 else 'LightGCN'
+            test_conclusion = 'Differenza statisticamente significativa a favore di %s (α = 0,05).' % winner
+        else:
+            test_conclusion = ('Il test non rileva una differenza statisticamente '
+                               'significativa al livello del 5%.')
     audits = json.loads((out / 'config.json').read_text(encoding='utf-8'))['seeds']
     policies = {(a['repeatable'], str(a['threshold_dgcdr']), str(a['threshold_lightgcn']))
                 for a in audits.values()}
@@ -393,20 +428,32 @@ def report(spec, out):
              'repeatable=%s; soglie salvate nei checkpoint: DGCDR %s, LightGCN %s.\n' % (
                  repeatable, threshold_dgcdr, threshold_lightgcn),
              'Train target: **%s**. Validation target: **%s**. Test target: **%s**. '
-             'Utenti test distinti: **%d**. Seed: %s. Epsilon: %g.\n' % (
+             'Utenti test distinti: **%d**. Seed: %s.\n' % (
                  audit_counts('train'), audit_counts('validation'), audit_counts('test'),
-                 n, spec['seeds'], eps),
+                 n, spec['seeds']),
              '## Risultati globali\n',
              table(['Modello', 'NDCG@20', 'Recall@20'], [[name, '%.6f'%summary['ndcg_'+key].mean(),
                  '%.6f'%summary['recall_'+key].mean()] for name,key in [('LightGCN','lightgcn'),('DGCDR','dgcdr')]]),
-             'Delta medio NDCG: **%.6f**, IC bootstrap utenti 95%% [%.6f, %.6f].\n' % (values.mean(),ci[0,0],ci[1,0]),
+             '**Definizione di Delta per utente:**\n\n'
+             '$$\n'
+             r'\Delta_u = \overline{\mathrm{NDCG@20}}_{u,\mathrm{DGCDR}}'
+             r' - \overline{\mathrm{NDCG@20}}_{u,\mathrm{LightGCN}}'
+             '\n$$\n\n'
+             'Per ciascun utente u, Delta è la differenza tra l’NDCG@20 di DGCDR e quello '
+             'di LightGCN. La barra indica la media sui seed per lo stesso utente. '
+             'Il risultato è espresso in punti NDCG: un valore positivo indica un miglioramento, '
+             'uno negativo un peggioramento e zero indica valori medi uguali. '
+             'Per esempio, con DGCDR = 0,22 e LightGCN = 0,20, Delta vale 0,02.\n',
+             classification_note,
              table(['Classe','Utenti','Percentuale'], [[c,int((summary['class']==c).sum()),
-                   '%.2f%%'%(100*(summary['class']==c).mean())] for c in ['Negative','Neutral','Positive']]),
-             'NDCG sempre zero per entrambi: %d utenti.\n' % summary.both_zero.sum(),
-             'Quota negative: IC 95%% [%.2f%%, %.2f%%]; positive: [%.2f%%, %.2f%%].\n' % tuple(100*ci[:,1:].T.flatten()),
-             'Guadagno medio tra positive: %s; perdita media tra negative: %s.\n' % (
-                 ('%.6f' % summary.loc[summary['class']=='Positive','delta_ndcg'].mean()) if (summary['class']=='Positive').any() else 'n/d',
-                 ('%.6f' % -summary.loc[summary['class']=='Negative','delta_ndcg'].mean()) if (summary['class']=='Negative').any() else 'n/d'),
+                   '%.2f%%'%(100*(summary['class']==c).mean())] for c in ['Negative','Positive','Neutral','NDCG@20 nullo']]),
+             '### T-test appaiato globale su NDCG@20\n'
+             'Confronto bilaterale sugli NDCG@20 medi sui seed degli stessi utenti, '
+             'inclusi quelli con NDCG nullo. Livello di significatività: 5%.\n',
+             table(['Misura', 'Valore'], test_rows),
+             test_conclusion + ' Il confronto riguarda i checkpoint e gli split osservati '
+             'e assume indipendenza tra utenti; la significatività statistica va valutata '
+             'insieme all’entità del miglioramento.\n',
              '## Variabilità fra seed\n',
              table(['Seed','NDCG LightGCN','NDCG DGCDR','Delta'], [[seed, *['%.6f'%v for v in group[
                  ['ndcg_lightgcn','ndcg_dgcdr','delta_ndcg']].mean()]] for seed,group in df.groupby('seed')])]
@@ -428,40 +475,85 @@ def report(spec, out):
         distribution = [[interval, int(count),
                          '%.2f%%' % (100 * count / n)]
                         for interval, count in counts.items()]
-        distribution.append(['Totale', n, '100.00%'])
         lines.extend(['### Dominio %s — %s\n' % (domain, spec[domain]),
                       table(['Interazioni train (media sui seed)', 'Utenti', 'Percentuale'],
                             distribution)])
-    lines.append('## Attività source × target\nN source e N target sono i numeri di interazioni '
-             'nel training di ciascun utente, mediati sui seed. Per ciascun dominio, i conteggi sono divisi '
-             'in base ai terzili: fascia 0 = attività bassa, 1 = media, 2 = alta. '
-             'Se due soglie coincidono, le fasce vengono accorpate e possono essere meno di tre. '
-             'La tabella mostra le soglie globali che definiscono ciascuna fascia: '
-             'rimangono uguali in tutte le combinazioni e la fascia più alta non ha un limite superiore. '
-             'Negative e Positive sono le percentuali di utenti nella combinazione con transfer '
-             'rispettivamente negativo e positivo.\n')
+    lines.append('## Attività source × target\n'
+                 'Le fasce sono definite sui numeri di interazioni nel training di ciascun utente, '
+                 'mediati sui seed. Le soglie sono globali per ciascun dominio e restano uguali '
+                 'in tutte le combinazioni; se due soglie coincidono, le fasce vengono accorpate.\n')
+    lines.append('**Legenda delle fasce:**\n')
+    for domain, prefix in (('source', 'S'), ('target', 'T')):
+        lines.append(f'**{domain.capitalize()} ({prefix}):**\n')
+        lines.append(table(['Fascia', 'Numero di interazioni nel training N'], [
+            [f'{prefix} = {index}', label]
+            for index, label in enumerate(bin_labels[domain])]))
+    lines.append('**Legenda delle colonne:**\n\n'
+                 '- **Fascia S:** livello di attività nel dominio source.\n'
+                 '- **Fascia T:** livello di attività nel dominio target.\n'
+                 '- **Utenti:** numero di utenti nella combinazione delle due fasce.\n'
+                 '- **Negative:** percentuale di utenti della combinazione con peggioramento '
+                 'di almeno l’1% rispetto a LightGCN.\n'
+                 '- **Positive:** percentuale di utenti della combinazione con miglioramento '
+                 'di almeno l’1% rispetto a LightGCN, inclusi i miglioramenti da LightGCN = 0.\n'
+                 '- **P̄ (%):** perdita percentuale dell’NDCG@20 medio dei soli utenti Negative '
+                 'rispetto alla loro media LightGCN.\n\n'
+                 '  $$\n'
+                 r'  \bar{P}(\%) = 100 \times '
+                 r'\frac{\text{NDCG medio LightGCN}_{\text{Negative}}-'
+                 r'\text{NDCG medio DGCDR}_{\text{Negative}}}'
+                 r'{\text{NDCG medio LightGCN}_{\text{Negative}}}'
+                 '\n  $$\n\n'
+                 '- **Ḡ (%):** guadagno percentuale dell’NDCG@20 medio dei soli utenti Positive '
+                 'rispetto alla loro media LightGCN.\n\n'
+                 '  $$\n'
+                 r'  \bar{G}(\%) = 100 \times '
+                 r'\frac{\text{NDCG medio DGCDR}_{\text{Positive}}-'
+                 r'\text{NDCG medio LightGCN}_{\text{Positive}}}'
+                 r'{\text{NDCG medio LightGCN}_{\text{Positive}}}'
+                 '\n  $$\n\n'
+                 '- **Delta (%):** variazione percentuale relativa dell’NDCG@20 medio '
+                 'di DGCDR rispetto a quello medio di LightGCN nella combinazione. '
+                 'Le medie includono tutti gli utenti della combinazione.\n\n'
+                 '  $$\n'
+                 r'  \text{Delta (\%)} = 100 \times '
+                 r'\frac{\text{NDCG medio DGCDR}-\text{NDCG medio LightGCN}}'
+                 r'{\text{NDCG medio LightGCN}}'
+                 '\n  $$\n\n'
+                 'La quota restante dopo Negative e Positive comprende Neutral e NDCG@20 nullo. '
+                 'Tutte le classi sono incluse in Utenti e nei denominatori delle percentuali di classe.\n\n'
+                 '**n/d** indica che la classe corrispondente è vuota oppure che la media '
+                 'LightGCN usata come denominatore è zero.\n')
     cells = []
     for (s,t), group in summary.groupby(['source_bin','target_bin']):
         neg = group[group['class']=='Negative']
-        cells.append([s,t,bin_labels['source'][s],bin_labels['target'][t],len(group),
-                      '%.6f'%group.delta_ndcg.mean(),'%.2f%%'%(100*(group['class']=='Negative').mean()),
+        pos = group[group['class']=='Positive']
+        mean_lightgcn = group.ndcg_lightgcn.mean()
+        neg_lightgcn = neg.ndcg_lightgcn.mean()
+        pos_lightgcn = pos.ndcg_lightgcn.mean()
+        loss_pct = ('%.2f%%' % (-100 * neg.delta_ndcg.mean() / neg_lightgcn)
+                    if len(neg) and neg_lightgcn else 'n/d')
+        gain_pct = ('%.2f%%' % (100 * pos.delta_ndcg.mean() / pos_lightgcn)
+                    if len(pos) and pos_lightgcn else 'n/d')
+        relative_delta = ('%.2f%%' % (100 * group.delta_ndcg.mean() / mean_lightgcn)
+                          if mean_lightgcn else 'n/d')
+        cells.append([s,t,len(group),
+                      '%.2f%%'%(100*(group['class']=='Negative').mean()),
                       '%.2f%%'%(100*(group['class']=='Positive').mean()),
-                      '%.6f'%(-neg.delta_ndcg.mean()) if len(neg) else 'n/d'])
-    lines.append(table(['Fascia S','Fascia T','N source','N target','Utenti','Delta',
-                        'Negative','Positive','Perdita negative'],cells))
+                      loss_pct,gain_pct,
+                      relative_delta])
+    lines.append(table(['Fascia S','Fascia T','Utenti','Negative',
+                        'Positive','P̄ (%)','Ḡ (%)','Delta (%)'],cells))
     lines.extend([
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
-        '[Risultati completi per utente e seed](per_user.csv).\n',
-        '## Controlli e limiti\nPer ogni seed sono stati verificati split target e item candidati identici fra modelli; '
-        'nessuna interazione target di validation/test entra nel grafo train. '
-        'In assenza dei dataloader originali, gli split sono ricostruiti da checkpoint, dataset e seed: '
-        'la coincidenza con il test storico non è dimostrabile dai soli pesi. '
-        'Gli intervalli ricampionano gli utenti e sono condizionati ai seed e split osservati; '
-        'le differenze DGCDR/LightGCN non isolano causalmente l’effetto del source.\n'])
+        '[Risultati completi per utente e seed](per_user.csv).\n'])
     (out / 'report.md').write_text('\n'.join(lines), encoding='utf-8')
     user_lines = ['# Confronto utenti test\n[Report generale](report.md)\n',
-                  'Metriche medie sui seed; conteggi medi riferiti al training. [Negative](#negative) · [Positive](#positive) · [Neutral](#neutral)\n']
-    for cls in ['Negative','Positive','Neutral']:
+                  'Metriche medie sui seed; conteggi medi riferiti al training. '
+                  '[Negative](#negative) · [Positive](#positive) · [Neutral](#neutral) · [NDCG@20 nullo](#ndcg20-nullo)\n',
+                  classification_note,
+                  'Seed negativi conta i seed in cui il peggioramento relativo è almeno dell’1%.\n']
+    for cls in ['Negative','Positive','Neutral','NDCG@20 nullo']:
         group = summary[summary['class']==cls]
         user_lines.extend(['## '+cls+'\n',table(['Utente','N source','N target','NDCG LGCN','NDCG DGCDR','Delta','Seed negativi','Std delta'],[
             [u,int(r.n_source_train),int(r.n_target_train),'%.6f'%r.ndcg_lightgcn,'%.6f'%r.ndcg_dgcdr,
