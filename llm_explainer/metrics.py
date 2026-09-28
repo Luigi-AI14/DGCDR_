@@ -176,7 +176,7 @@ SBERT_ALIASES: Dict[str, str] = {
 }
 
 
-def validate_and_resolve_sbert_model(model_name: str) -> str:
+def validate_and_resolve_sbert_model(model_name: str, trust_remote_code: bool = True) -> str:
     """
     Validates that a Sentence-BERT model identifier exists (locally or on Hugging Face Hub).
     Automatically maps common shorthand aliases (e.g. 'bge-large-en-v1.5' -> 'BAAI/bge-large-en-v1.5').
@@ -201,7 +201,7 @@ def validate_and_resolve_sbert_model(model_name: str) -> str:
         last_error = None
         for cand in candidate_names:
             try:
-                AutoConfig.from_pretrained(cand)
+                AutoConfig.from_pretrained(cand, trust_remote_code=trust_remote_code)
                 return cand
             except Exception as e:
                 last_error = e
@@ -225,6 +225,7 @@ def validate_and_resolve_sbert_model(model_name: str) -> str:
             "Tip: Models from organizations other than 'sentence-transformers' must include the "
             "organization prefix, for example:\n"
             "  --sbert_model BAAI/bge-large-en-v1.5\n"
+            "  --sbert_model Alibaba-NLP/gte-large-en-v1.5\n"
             "  --sbert_model intfloat/e5-large-v2\n"
             "  --sbert_model sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -235,29 +236,49 @@ def validate_and_resolve_sbert_model(model_name: str) -> str:
 _DEFAULT_SBERT_MODEL = None
 
 
-def get_sbert_model(model_name: str = "all-MiniLM-L6-v2") -> Any:
+def get_sbert_model(
+    model_name: str = "all-MiniLM-L6-v2",
+    trust_remote_code: bool = True,
+    max_seq_length: Optional[int] = 512,
+) -> Any:
     """
     Lazy-loads and caches the Sentence-BERT model (singleton pattern).
     Uses CUDA if available, falling back gracefully to CPU.
+    Enables trust_remote_code=True by default for models requiring custom architectures (e.g. Alibaba-NLP/gte).
+    Caps max_seq_length (default: 512) to prevent quadratic attention VRAM explosion on 8k+ context models.
     """
     global _DEFAULT_SBERT_MODEL
     if _DEFAULT_SBERT_MODEL is None:
-        resolved_name = validate_and_resolve_sbert_model(model_name)
+        resolved_name = validate_and_resolve_sbert_model(model_name, trust_remote_code=trust_remote_code)
         try:
             import torch
             from sentence_transformers import SentenceTransformer
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
             try:
-                _DEFAULT_SBERT_MODEL = SentenceTransformer(resolved_name, device=device)
+                _DEFAULT_SBERT_MODEL = SentenceTransformer(
+                    resolved_name, device=device, trust_remote_code=trust_remote_code
+                )
             except Exception:
                 # Fallback to CPU if device initialization issues occur
-                _DEFAULT_SBERT_MODEL = SentenceTransformer(resolved_name, device="cpu")
+                _DEFAULT_SBERT_MODEL = SentenceTransformer(
+                    resolved_name, device="cpu", trust_remote_code=trust_remote_code
+                )
         except ImportError:
             raise ImportError(
                 "sentence-transformers is required for semantic evaluation. "
                 "Install it with 'pip install sentence-transformers'."
             )
+
+        # Cap max_seq_length to prevent quadratic attention VRAM explosion
+        if max_seq_length is not None and hasattr(_DEFAULT_SBERT_MODEL, "max_seq_length"):
+            orig_len = _DEFAULT_SBERT_MODEL.max_seq_length
+            if orig_len > max_seq_length:
+                logger.info(
+                    f"Capped model max_seq_length from {orig_len} to {max_seq_length} "
+                    f"to prevent VRAM explosion (amply covers all reviews & explanations)."
+                )
+                _DEFAULT_SBERT_MODEL.max_seq_length = max_seq_length
     return _DEFAULT_SBERT_MODEL
 
 
@@ -460,12 +481,27 @@ class ReferenceEmbeddingCache:
             unique_missing_keys = list(missing_keys_to_text.keys())
             unique_missing_texts = [missing_keys_to_text[k] for k in unique_missing_keys]
 
-            new_embs = sbert_model.encode(
-                unique_missing_texts,
-                batch_size=batch_size,
-                normalize_embeddings=True,
-                show_progress_bar=len(unique_missing_texts) > 50,
-            )
+            try:
+                import torch
+                inference_ctx = torch.inference_mode()
+            except Exception:
+                from contextlib import nullcontext
+                inference_ctx = nullcontext()
+
+            with inference_ctx:
+                new_embs = sbert_model.encode(
+                    unique_missing_texts,
+                    batch_size=batch_size,
+                    normalize_embeddings=True,
+                    show_progress_bar=len(unique_missing_texts) > 20,
+                )
+
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
             for k, emb in zip(unique_missing_keys, new_embs):
                 self._cache[k] = emb
@@ -484,7 +520,7 @@ class ReferenceEmbeddingCache:
 def batch_compute_candidate_embeddings(
     candidate_texts: List[str],
     sbert_model: Any,
-    batch_size: int = 64,
+    batch_size: int = 16,
 ) -> Any:
     """
     Computes normalized embeddings for candidate explanations in batches.
@@ -514,12 +550,27 @@ def batch_compute_candidate_embeddings(
     logger.info(
         f"Encoding {len(valid_texts)} candidate explanations in batches (batch_size={batch_size}, device: {getattr(sbert_model, 'device', 'cpu')})..."
     )
-    encoded_valid = sbert_model.encode(
-        valid_texts,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=len(valid_texts) > 50,
-    )
+    try:
+        import torch
+        inference_ctx = torch.inference_mode()
+    except Exception:
+        from contextlib import nullcontext
+        inference_ctx = nullcontext()
+
+    with inference_ctx:
+        encoded_valid = sbert_model.encode(
+            valid_texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=len(valid_texts) > 20,
+        )
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     dim = encoded_valid.shape[1]
     all_embs = np.zeros((len(candidate_texts), dim), dtype=np.float32)

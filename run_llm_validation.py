@@ -23,6 +23,7 @@ from recbole.utils import init_seed
 
 from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
 from llm_explainer.data_extractor import DataExtractor
+from llm_explainer.explanation_cache import ExplanationCache
 from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
 from llm_explainer.metrics import (
     ReferenceEmbeddingCache,
@@ -136,13 +137,24 @@ def parse_args():
     parser.add_argument(
         "--sbert_batch_size",
         type=int,
-        default=64,
-        help="Batch size for Sentence-BERT embedding encoding (default: 64).",
+        default=16,
+        help="Batch size for Sentence-BERT embedding encoding (default: 16 to safely fit in GPU VRAM).",
+    )
+    parser.add_argument(
+        "--sbert_max_seq_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length tokens for Sentence-BERT model (default: 512, prevents quadratic VRAM explosion on 8k models).",
     )
     parser.add_argument(
         "--no_cache_sbert",
         action="store_true",
         help="Disable on-disk caching of reference review embeddings.",
+    )
+    parser.add_argument(
+        "--no_cache_llm",
+        action="store_true",
+        help="Disable loading cached LLM explanations and force fresh generation via Ollama.",
     )
     parser.add_argument(
         "--dry_run",
@@ -184,7 +196,9 @@ def main():
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"SBERT Batch Size:    {args.sbert_batch_size}")
+    print(f"SBERT Max Seq Len:   {args.sbert_max_seq_length} tokens")
     print(f"SBERT Cache Enabled: {not args.no_cache_sbert}")
+    print(f"LLM Cache Enabled:   {not args.no_cache_llm}")
     print(f"Context Window:      {args.num_ctx} tokens")
     print(f"Quintile Min Words:  >= {args.min_review_words} words (excluding < {args.min_review_words})")
     print(f"Use Title in Q-Word: {args.use_title_in_quintiles}")
@@ -220,6 +234,19 @@ def main():
         min_rating=args.rating_threshold,
         use_title=args.use_title_in_quintiles,
     )
+
+    # 2.5 Initialize LLM Explanation cache
+    expl_cache = ExplanationCache(
+        domain_pair=args.domain_pair,
+        model_name=args.model,
+    )
+    if not args.no_cache_llm:
+        logger.info(
+            f"LLM Explanation Cache active: {expl_cache.total_explanations} explanations "
+            f"for {expl_cache.total_users} users available on disk."
+        )
+    else:
+        logger.info("LLM Explanation Cache disabled via --no_cache_llm flag.")
 
     # 3. Sentence-BERT model will be loaded after LLM generation to maximize GPU VRAM
     logger.info(
@@ -293,20 +320,35 @@ def main():
         )
         logger.info(f"  Prompt generated and saved to: {prompt_file}")
 
-        # Call LLM
-        logger.info(f"  Generating explanations with {args.model}...")
-        try:
-            llm_explanations = ollama_client.generate_explanations(
-                prompt=prompt_text,
-                mock=args.dry_run,
-                expected_items=recommended_for_prompt,
-            )
-        except Exception as e:
-            logger.error(f"  Error calling LLM for user {uid}: {e}")
-            llm_explanations = []
+        # Obtain explanations: check cache first, otherwise invoke LLM
+        expected_ids = [it["item_id"] for it in user["held_out_items"]]
+        cached_expls = (
+            expl_cache.get_user_explanations(uid, expected_ids)
+            if (not args.no_cache_llm and not args.dry_run)
+            else None
+        )
 
-        # Index explanations by item_id
-        expl_map = {entry["item_id"]: entry.get("explanation", "") for entry in llm_explanations}
+        if cached_expls is not None:
+            logger.info(
+                f"  [LLM Cache Hit] Reusing {len(cached_expls)} pre-computed explanations for user {uid}."
+            )
+            expl_map = cached_expls
+        else:
+            logger.info(f"  Generating explanations with {args.model}...")
+            try:
+                llm_explanations = ollama_client.generate_explanations(
+                    prompt=prompt_text,
+                    mock=args.dry_run,
+                    expected_items=recommended_for_prompt,
+                )
+            except Exception as e:
+                logger.error(f"  Error calling LLM for user {uid}: {e}")
+                llm_explanations = []
+
+            # Index explanations by item_id
+            expl_map = {entry["item_id"]: entry.get("explanation", "") for entry in llm_explanations}
+            if not args.dry_run and not args.no_cache_llm:
+                expl_cache.set_user_explanations(uid, llm_explanations)
 
         # Calculate metrics for each held-out item
         user_items_evaluated = []
@@ -398,6 +440,10 @@ def main():
             f"ROUGE-2: {avg_r2:.4f} | ROUGE-L: {avg_rl:.4f}"
         )
 
+    # Save any newly generated explanations to disk cache
+    if expl_cache.is_dirty and not args.no_cache_llm:
+        expl_cache.save()
+
     # 5.5 Free GPU VRAM: Unload LLM from Ollama and clear GPU memory
     if not args.dry_run:
         logger.info("\n" + "=" * 80)
@@ -423,7 +469,10 @@ def main():
     logger.info(" BATCH SEMANTIC EVALUATION (Sentence-BERT) ")
     logger.info("=" * 80)
     logger.info(f"Loading Sentence-BERT model: {args.sbert_model}...")
-    sbert_model = get_sbert_model(model_name=args.sbert_model)
+    sbert_model = get_sbert_model(
+        model_name=args.sbert_model,
+        max_seq_length=args.sbert_max_seq_length,
+    )
 
     ref_cache = ReferenceEmbeddingCache(
         domain_pair=args.domain_pair,

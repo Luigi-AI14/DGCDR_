@@ -12,6 +12,7 @@ DGCDR_/
 │   ├── __init__.py           # Package exports
 │   ├── config.py             # Domain pairs, file paths, default parameters
 │   ├── metrics.py            # BLEU, ROUGE-1/2/L, SBERT, ReferenceEmbeddingCache, batch encoding
+│   ├── explanation_cache.py  # Persistent on-disk cache for deterministic LLM explanations
 │   ├── ollama_client.py      # Ollama REST client (supports Qwen 3.5 9B with 32k context)
 │   ├── markdown_exporter.py  # Markdown report exporter and results organizer
 │   ├── prompt_builder.py     # Prompt formatter in English + prompt file writer
@@ -28,6 +29,8 @@ DGCDR_/
 │           └── <source>-<target>_<model>_<timestamp>.md
 ├── cache/                    # Local caches for fast execution
 │   ├── compact_<pair>.pkl    # Compact preprocessed dataset cache (< 1s load time)
+│   ├── explanations/         # Persistent disk cache for LLM generated explanations
+│   │   └── expl_<pair>_<model>.pkl
 │   └── embeddings/           # Persistent disk cache for reference review embeddings
 │       └── ref_emb_<pair>_<sbert_model>.pkl
 ├── preprocess_compact_data.py # CLI script to build compact datasets (< 1s load time)
@@ -44,13 +47,16 @@ To support heavier Sentence-BERT and text-embedding models (e.g., *all-MiniLM-L6
 
 ```mermaid
 flowchart TD
-    A["1. User & Held-Out Data Extraction (RecBole Split, Seed 42)"] --> B["2. LLM Inference Loop (Ollama)"]
-    B --> C["3. Fast Syntactic Metrics (BLEU, ROUGE-1/2/L on CPU)"]
+    A["1. User & Held-Out Data Extraction (RecBole Split, Seed 42)"] --> B{"2. LLM Explanation Cache Check"}
+    B -- Cache Hit --> C["3. Fast Syntactic Metrics (BLEU, ROUGE-1/2/L on CPU)"]
+    B -- Cache Miss --> B1["Ollama LLM Generation (temperature=0.0)"]
+    B1 --> B2["Save to Disk Cache (cache/explanations/*.pkl)"]
+    B2 --> C
     C --> D["4. BATCH SEMANTIC EVALUATION (Sentence-BERT at Pipeline End)"]
     
     subgraph "Phase 4: High-Throughput Batch Processing"
         D1["Ground-Truth Review Cache (cache/embeddings/*.pkl)"]
-        D2["Batch Encoding of Candidate Explanations (batch_size=64 on GPU)"]
+        D2["Batch Encoding of Candidate Explanations (batch_size=16/64 on GPU)"]
         D3["Vectorized Cosine Similarity (Dot Product)"]
         D1 --> D3
         D2 --> D3
@@ -62,14 +68,20 @@ flowchart TD
 ```
 
 ### Key Architectural Advantages:
-1. **Deferred SBERT Loading & Active VRAM Deallocation**:
+1. **Deterministic LLM Explanation Caching (`cache/explanations/`)**:
+   - Because generation uses `temperature=0.0` and deterministic RecBole seeds, LLM explanations for a given user and item remain completely invariant.
+   - All explanations are automatically indexed and saved to `cache/explanations/expl_<pair>_<model>.pkl`.
+   - The cache also auto-imports pre-existing explanations from previous runs in `results/`.
+   - When benchmarking different Sentence-BERT models (e.g. comparing `all-MiniLM-L6-v2`, `BAAI/bge-large-en-v1.5`, and `Alibaba-NLP/gte-large-en-v1.5`), the time-consuming LLM generation phase is **100% skipped on cache hit**, allowing immediate batch semantic evaluation in seconds.
+   - Use `--no_cache_llm` to bypass the cache and force regeneration if needed.
+2. **Deferred SBERT Loading & Active VRAM Deallocation**:
    - The Sentence-BERT model is **not** loaded during LLM generation.
    - Once explanation generation is completed for all users, the framework automatically triggers an explicit unload command (`keep_alive=0`) via Ollama's API and invokes PyTorch's `cuda.empty_cache()`. This evicts the LLM weights and context from VRAM, freeing 100% of the GPU memory for the embedding model.
-2. **Persistent On-Disk Cache for Reference Reviews**:
+3. **Persistent On-Disk Cache for Reference Reviews (`cache/embeddings/`)**:
    - Because target held-out items and ground-truth reviews are deterministic (fixed RecBole seed `42`), their embeddings remain identical across different validation runs, prompts, temperatures, and LLMs.
-   - Embeddings are indexed by SHA-256 hash in `cache/embeddings/ref_emb_<pair>_<model>.pkl`. On subsequent runs, reference embeddings achieve a **100% cache hit (~0 ms)**.
-3. **GPU Batching & Vectorized Dot Product**:
-   - Rather than encoding pairs one-by-one (`batch_size=2`), all candidate explanations across all users are encoded together using GPU batching (`--sbert_batch_size 64`).
+   - Embeddings are indexed by SHA-256 hash in `cache/embeddings/ref_emb_<pair>_<sbert_model>.pkl`. On subsequent runs, reference embeddings achieve a **100% cache hit (~0 ms)**.
+4. **GPU Batching & Vectorized Dot Product**:
+   - Rather than encoding pairs one-by-one (`batch_size=2`), all candidate explanations across all users are encoded together using GPU batching (`--sbert_batch_size 16` or `64`).
    - Cosine similarity is computed in a single vectorized NumPy matrix operation (`np.sum(cand_embs * ref_embs, axis=1)`), boosting evaluation speed by **10x–50x**.
 
 ---
@@ -139,8 +151,10 @@ This generates `cache/compact_<pair>.pkl` and `cache/compact_<pair>.json`, enabl
 | `--ollama_url` | `str` | `http://localhost:11434` | Ollama API endpoint |
 | `--num_ctx` | `int` | `32768` | Ollama context window size |
 | `--sbert_model` | `str` | `all-MiniLM-L6-v2` | Sentence-BERT model name for semantic similarity |
-| `--sbert_batch_size` | `int` | `64` | Batch size for Sentence-BERT embedding encoding |
+| `--sbert_batch_size` | `int` | `16` | Batch size for Sentence-BERT embedding encoding (safe default for VRAM) |
+| `--sbert_max_seq_length` | `int` | `512` | Max sequence tokens for embedding model (prevents VRAM explosion on 8k models) |
 | `--no_cache_sbert` | `flag` | `False` | Disable on-disk caching of reference review embeddings |
+| `--no_cache_llm` | `flag` | `False` | Disable on-disk caching of LLM explanations (force regeneration) |
 | `--min_review_words` | `int` | `5` | Minimum words threshold to filter ultra-short reviews in quintiles |
 | `--use_title_in_quintiles`| `flag`| `False` | Whether to include review title in quintile word count classification |
 | `--prompts_dir` | `str` | `saved_prompts` | Directory where user prompts are saved |
