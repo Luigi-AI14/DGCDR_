@@ -190,3 +190,50 @@ class OllamaClient:
 
         logger.error(f"Failed to extract explanations from LLM response:\n{raw_text}")
         raise ValueError(f"Model output did not contain valid explanations: {raw_text}")
+
+    def get_loaded_models(self) -> List[str]:
+        """Returns list of currently loaded model names in Ollama VRAM."""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/api/ps", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        except Exception as e:
+            logger.debug(f"Could not check loaded models via /api/ps: {e}")
+            return []
+
+    def unload_model(self, model: Optional[str] = None) -> bool:
+        """
+        Explicitly unloads a model from GPU VRAM by sending keep_alive=0 to Ollama.
+        """
+        target_model = model or self.model
+        url = f"{self.base_url}/api/generate"
+        payload = {"model": target_model, "keep_alive": 0}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    logger.info(f"Successfully unloaded LLM model '{target_model}' from GPU VRAM.")
+                    return True
+        except Exception as e:
+            logger.warning(f"Could not unload model '{target_model}' from Ollama: {e}")
+        return False
+
+    def unload_all_models(self) -> None:
+        """
+        Unloads self.model and any other active models in Ollama VRAM to ensure
+        maximum GPU memory availability for downstream embedding models.
+        """
+        loaded = self.get_loaded_models()
+        targets = set(loaded)
+        if self.model:
+            targets.add(self.model)
+
+        for m in targets:
+            self.unload_model(m)

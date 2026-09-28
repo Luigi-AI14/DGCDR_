@@ -24,7 +24,15 @@ from recbole.utils import init_seed
 from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
 from llm_explainer.data_extractor import DataExtractor
 from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
-from llm_explainer.metrics import evaluate_explanation_vs_review, get_sbert_model
+from llm_explainer.metrics import (
+    ReferenceEmbeddingCache,
+    batch_compute_candidate_embeddings,
+    batch_compute_cosine_similarities,
+    compute_syntactic_metrics,
+    format_reference_with_title,
+    get_sbert_model,
+    validate_and_resolve_sbert_model,
+)
 from llm_explainer.ollama_client import OllamaClient
 from llm_explainer.prompt_builder import build_user_prompt
 from llm_explainer.quintiles import QuintileManager
@@ -126,6 +134,17 @@ def parse_args():
         help="Ollama context window size num_ctx (default: 32768).",
     )
     parser.add_argument(
+        "--sbert_batch_size",
+        type=int,
+        default=64,
+        help="Batch size for Sentence-BERT embedding encoding (default: 64).",
+    )
+    parser.add_argument(
+        "--no_cache_sbert",
+        action="store_true",
+        help="Disable on-disk caching of reference review embeddings.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
@@ -138,6 +157,22 @@ def main():
     args = parse_args()
     init_seed(args.seed, reproducibility=True)
 
+    # 0. Early Validation: Check that the Sentence-BERT model exists and resolves BEFORE running any heavy tasks or Ollama
+    try:
+        resolved_sbert = validate_and_resolve_sbert_model(args.sbert_model)
+        if resolved_sbert != args.sbert_model:
+            logger.info(f"Resolved shorthand SBERT model '{args.sbert_model}' -> '{resolved_sbert}'")
+            args.sbert_model = resolved_sbert
+        logger.info(f"Sentence-BERT model identifier verified: '{args.sbert_model}'")
+    except ValueError as e:
+        print("\n" + "!" * 90)
+        print(" [FATAL ERROR] Invalid Sentence-BERT model identifier")
+        print("!" * 90)
+        print(f"{e}\n")
+        print("Aborting execution immediately to prevent wasted computation.")
+        print("!" * 90 + "\n")
+        sys.exit(1)
+
     print("=" * 80)
     print(" DGCDR EXPLANATION & VALIDATION PIPELINE ")
     print("=" * 80)
@@ -148,6 +183,8 @@ def main():
     print(f"Rating Threshold:    >= {args.rating_threshold}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
+    print(f"SBERT Batch Size:    {args.sbert_batch_size}")
+    print(f"SBERT Cache Enabled: {not args.no_cache_sbert}")
     print(f"Context Window:      {args.num_ctx} tokens")
     print(f"Quintile Min Words:  >= {args.min_review_words} words (excluding < {args.min_review_words})")
     print(f"Use Title in Q-Word: {args.use_title_in_quintiles}")
@@ -184,9 +221,11 @@ def main():
         use_title=args.use_title_in_quintiles,
     )
 
-    # 3. Pre-load Sentence-BERT model for semantic evaluation
-    logger.info(f"Loading Sentence-BERT model: {args.sbert_model}...")
-    sbert_model = get_sbert_model(model_name=args.sbert_model)
+    # 3. Sentence-BERT model will be loaded after LLM generation to maximize GPU VRAM
+    logger.info(
+        f"Sentence-BERT model ({args.sbert_model}) will be loaded at the end of the pipeline "
+        f"for batched GPU encoding (batch_size={args.sbert_batch_size}, cache={not args.no_cache_sbert})."
+    )
 
     # 4. Extract Data & Splits
     extractor = DataExtractor(
@@ -225,8 +264,9 @@ def main():
     global_rl_scores = []
     global_sbert_scores = []
     all_evaluated_items = []
+    eval_items_queue = []
 
-    # 5. Process each user
+    # 5. Process each user (LLM Generation + Fast Syntactic Metrics)
     for u_idx, user in enumerate(users_data, 1):
         uid = user["user_id"]
         logger.info(f"\n[{u_idx}/{len(users_data)}] Processing User: {uid}")
@@ -274,7 +314,6 @@ def main():
         user_r1 = []
         user_r2 = []
         user_rl = []
-        user_sbert = []
 
         for held_it in user["held_out_items"]:
             iid = held_it["item_id"]
@@ -293,25 +332,25 @@ def main():
             )
             is_filtered_ultrashort = (q_id is None)
 
-            # Evaluate syntactic (BLEU, ROUGE) and semantic (Sentence-BERT with review title)
-            metrics = evaluate_explanation_vs_review(
+            # Evaluate syntactic metrics fast (BLEU, ROUGE)
+            metrics = compute_syntactic_metrics(
                 candidate_text=explanation,
                 reference_text=ground_truth_text,
-                reference_title=ground_truth_title,
-                sbert_model=sbert_model,
             )
+            # Placeholder for sbert_similarity (will be populated in batch evaluation)
+            metrics["sbert_similarity"] = 0.0
+
+            semantic_ref = format_reference_with_title(ground_truth_text, ground_truth_title)
 
             user_bleu.append(metrics["bleu"])
             user_r1.append(metrics["rouge1_f1"])
             user_r2.append(metrics["rouge2_f1"])
             user_rl.append(metrics["rougeL_f1"])
-            user_sbert.append(metrics["sbert_similarity"])
 
             global_bleu_scores.append(metrics["bleu"])
             global_r1_scores.append(metrics["rouge1_f1"])
             global_r2_scores.append(metrics["rouge2_f1"])
             global_rl_scores.append(metrics["rougeL_f1"])
-            global_sbert_scores.append(metrics["sbert_similarity"])
 
             item_record = {
                 "id_item": iid,
@@ -328,12 +367,17 @@ def main():
             user_items_evaluated.append(item_record)
             all_evaluated_items.append(item_record)
 
-        # User averages
+            eval_items_queue.append({
+                "item_record": item_record,
+                "candidate_text": explanation,
+                "reference_text": semantic_ref,
+            })
+
+        # User averages (syntactic for now, SBERT updated in batch step)
         avg_bleu = round(sum(user_bleu) / len(user_bleu), 4) if user_bleu else 0.0
         avg_r1 = round(sum(user_r1) / len(user_r1), 4) if user_r1 else 0.0
         avg_r2 = round(sum(user_r2) / len(user_r2), 4) if user_r2 else 0.0
         avg_rl = round(sum(user_rl) / len(user_rl), 4) if user_rl else 0.0
-        avg_sbert = round(sum(user_sbert) / len(user_sbert), 4) if user_sbert else 0.0
 
         user_result = {
             "user_id": uid,
@@ -344,24 +388,101 @@ def main():
                 "avg_rouge1_f1": avg_r1,
                 "avg_rouge2_f1": avg_r2,
                 "avg_rougeL_f1": avg_rl,
-                "avg_sbert_similarity": avg_sbert,
+                "avg_sbert_similarity": 0.0,
             },
         }
         all_user_results.append(user_result)
 
         logger.info(
-            f"  User Averages -> BLEU: {avg_bleu:.4f} | ROUGE-1: {avg_r1:.4f} | "
-            f"ROUGE-2: {avg_r2:.4f} | ROUGE-L: {avg_rl:.4f} | SBERT Sim: {avg_sbert:.4f}"
+            f"  User Syntactic Averages -> BLEU: {avg_bleu:.4f} | ROUGE-1: {avg_r1:.4f} | "
+            f"ROUGE-2: {avg_r2:.4f} | ROUGE-L: {avg_rl:.4f}"
         )
 
-    # 6. Global Averages
+    # 5.5 Free GPU VRAM: Unload LLM from Ollama and clear GPU memory
+    if not args.dry_run:
+        logger.info("\n" + "=" * 80)
+        logger.info(" FREEING GPU VRAM (Unloading LLM from Ollama) ")
+        logger.info("=" * 80)
+        ollama_client.unload_all_models()
+        try:
+            import gc
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                logger.info(
+                    f"GPU VRAM available for embedding model: {free_bytes / (1024**2):.0f} MB free / {total_bytes / (1024**2):.0f} MB total."
+                )
+        except Exception as e:
+            logger.debug(f"PyTorch CUDA cache clear note: {e}")
+
+    # 6. Batch Semantic Evaluation (Sentence-BERT with disk cache)
+    logger.info("\n" + "=" * 80)
+    logger.info(" BATCH SEMANTIC EVALUATION (Sentence-BERT) ")
+    logger.info("=" * 80)
+    logger.info(f"Loading Sentence-BERT model: {args.sbert_model}...")
+    sbert_model = get_sbert_model(model_name=args.sbert_model)
+
+    ref_cache = ReferenceEmbeddingCache(
+        domain_pair=args.domain_pair,
+        sbert_model_name=args.sbert_model,
+    )
+
+    all_candidates = [q["candidate_text"] for q in eval_items_queue]
+    all_references = [q["reference_text"] for q in eval_items_queue]
+
+    logger.info(
+        f"Retrieving/Encoding {len(all_references)} reference reviews (cache enabled: {not args.no_cache_sbert})..."
+    )
+    ref_embs = ref_cache.get_or_compute_batch(
+        reference_texts=all_references,
+        sbert_model=sbert_model,
+        batch_size=args.sbert_batch_size,
+        use_cache=not args.no_cache_sbert,
+    )
+
+    logger.info(
+        f"Batch-encoding {len(all_candidates)} LLM candidate explanations (batch_size={args.sbert_batch_size})..."
+    )
+    cand_embs = batch_compute_candidate_embeddings(
+        candidate_texts=all_candidates,
+        sbert_model=sbert_model,
+        batch_size=args.sbert_batch_size,
+    )
+
+    logger.info("Computing cosine similarities via vectorized dot product...")
+    sbert_similarities = batch_compute_cosine_similarities(
+        cand_embs=cand_embs,
+        ref_embs=ref_embs,
+        candidate_texts=all_candidates,
+    )
+
+    global_sbert_scores = list(sbert_similarities)
+    for q_idx, sim in enumerate(sbert_similarities):
+        queue_entry = eval_items_queue[q_idx]
+        queue_entry["item_record"]["metrics"]["sbert_similarity"] = sim
+
+    # Update user-level averages for SBERT
+    logger.info("\nUpdated User Averages with SBERT Similarity:")
+    for u_res in all_user_results:
+        u_sims = [it["metrics"]["sbert_similarity"] for it in u_res["items"]]
+        u_avg_sbert = round(sum(u_sims) / len(u_sims), 4) if u_sims else 0.0
+        u_res["user_averages"]["avg_sbert_similarity"] = u_avg_sbert
+        logger.info(
+            f"  User {u_res['user_id']} -> SBERT Sim: {u_avg_sbert:.4f} | BLEU: {u_res['user_averages']['avg_bleu']:.4f} | "
+            f"ROUGE-1: {u_res['user_averages']['avg_rouge1_f1']:.4f} | ROUGE-L: {u_res['user_averages']['avg_rougeL_f1']:.4f}"
+        )
+
+    # 7. Global Averages
     macro_bleu = round(sum(global_bleu_scores) / len(global_bleu_scores), 4) if global_bleu_scores else 0.0
     macro_r1 = round(sum(global_r1_scores) / len(global_r1_scores), 4) if global_r1_scores else 0.0
     macro_r2 = round(sum(global_r2_scores) / len(global_r2_scores), 4) if global_r2_scores else 0.0
     macro_rl = round(sum(global_rl_scores) / len(global_rl_scores), 4) if global_rl_scores else 0.0
     macro_sbert = round(sum(global_sbert_scores) / len(global_sbert_scores), 4) if global_sbert_scores else 0.0
 
-    # 7. Stratified Metrics by Review Quintiles (excluding < min_review_words)
+    # 8. Stratified Metrics by Review Quintiles (excluding < min_review_words)
     valid_items = [it for it in all_evaluated_items if not it["is_filtered_ultrashort"]]
     filtered_items = [it for it in all_evaluated_items if it["is_filtered_ultrashort"]]
 
