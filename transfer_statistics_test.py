@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from scipy.stats import ttest_rel
+from scipy.stats import t, ttest_rel
 
 
 @dataclass(frozen=True)
@@ -49,11 +49,16 @@ def global_paired_ttest(dgcdr, lightgcn):
         return PairedTTestResult(n, mean_delta, None, None, None, None, None,
                                  'la varianza delle differenze è zero')
 
-    result = ttest_rel(dgcdr, lightgcn, alternative='two-sided', nan_policy='raise')
-    ci = result.confidence_interval(confidence_level=0.95)
-    estimates = np.array([result.statistic, result.pvalue, ci.low, ci.high])
+    # The default paired test is two-sided. Compute its interval explicitly so
+    # older SciPy Ttest_relResult objects need no confidence_interval() or df.
+    result = ttest_rel(dgcdr, lightgcn, nan_policy='raise')
+    degrees_of_freedom = n - 1
+    standard_error = float(delta.std(ddof=1) / np.sqrt(n))
+    half_width = float(t.ppf(0.975, degrees_of_freedom) * standard_error)
+    ci_low, ci_high = mean_delta - half_width, mean_delta + half_width
+    estimates = np.array([result.statistic, result.pvalue, ci_low, ci_high])
     if not np.isfinite(estimates).all():
         return PairedTTestResult(n, mean_delta, None, None, None, None, None,
                                  'il test ha prodotto valori numerici non finiti')
-    return PairedTTestResult(n, mean_delta, float(result.statistic), int(result.df),
-                             float(result.pvalue), float(ci.low), float(ci.high))
+    return PairedTTestResult(n, mean_delta, float(result.statistic), degrees_of_freedom,
+                             float(result.pvalue), ci_low, ci_high)
