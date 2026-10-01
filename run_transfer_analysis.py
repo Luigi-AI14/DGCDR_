@@ -22,12 +22,10 @@ import sys
 import numpy as np
 import torch
 import yaml
-from recbole.data import create_dataset as create_light_dataset
-from recbole.data import data_preparation as prepare_light_data
-from recbole.model.general_recommender.lightgcn import LightGCN
-from recbole.utils import init_seed
-from recbole_cdr.data import create_dataset, data_preparation
-from recbole_cdr.model.cross_domain_recommender.dgcdr import DGCDR
+from analysis_common import (
+    pairs, histories, token_map, token_pairs, token_histories, checkpoint_config,
+    reconstruct_data, load_predictor, validate_transfer_preparation,
+)
 from transfer_statistics_test import global_paired_ttest, validate_ndcg_values
 
 ROOT = Path(__file__).resolve().parent
@@ -41,64 +39,6 @@ def atomic_json(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(value, indent=2, default=str) + '\n', encoding='utf-8')
     tmp.replace(path)
-
-
-def pairs(dataset):
-    f = dataset.inter_feat
-    return set(zip(f[dataset.uid_field].tolist(), f[dataset.iid_field].tolist()))
-
-
-def histories(dataset):
-    result = {}
-    for u, i in pairs(dataset):
-        result.setdefault(u, set()).add(i)
-    return result
-
-
-def token_map(dataset, field):
-    # In some DGCDR datasets id2token is stale after remapping; invert the live map.
-    inverse = {int(index): str(token) for token, index in dataset.field2token_id[field].items()}
-    if len(inverse) != len(dataset.field2token_id[field]):
-        raise ValueError('Non-unique token mapping for ' + field)
-    return inverse
-
-
-def token_pairs(dataset):
-    users = token_map(dataset, dataset.uid_field)
-    items = token_map(dataset, dataset.iid_field)
-    return {(users[u], items[i]) for u, i in pairs(dataset)}
-
-
-def token_histories(dataset):
-    result = {}
-    for user, item in token_pairs(dataset):
-        result.setdefault(user, set()).add(item)
-    return result
-
-
-def checkpoint_config(state, path, model, seed, spec, out):
-    config = state['config']
-    if config['model'] != model or int(config['seed']) != seed:
-        raise ValueError(f'{path}: checkpoint model/seed differs from requested {model}/{seed}')
-    target = config['target_domain']['dataset'] if model == 'DGCDR' else config['dataset']
-    if target != spec['target']:
-        raise ValueError(f'{path}: target domain {target} differs from {spec["target"]}')
-    if model == 'DGCDR' and config['source_domain']['dataset'] != spec['source']:
-        raise ValueError(f'{path}: unexpected source domain')
-    # Checkpoints may contain absolute paths from another computer. Change paths only.
-    if model == 'DGCDR':
-        for domain in ('source', 'target'):
-            name = config[domain + '_domain']['dataset']
-            config[domain + '_domain']['data_path'] = str(ROOT / 'dataset' / name)
-    else:
-        config['data_path'] = str(ROOT / 'dataset' / target)
-    config['use_gpu'] = bool(spec.get('use_gpu', True))
-    config['device'] = torch.device('cuda' if config['use_gpu'] and torch.cuda.is_available() else 'cpu')
-    config['checkpoint_dir'] = str(out / '_no_saved_dataloaders' / model / str(seed))
-    config['dataloaders_save_path'] = None
-    config['save_dataloaders'] = False
-    config['save_dataset'] = False
-    return config
 
 
 def checkpoint_paths(spec, args):
@@ -195,30 +135,13 @@ def reconstruct(spec, out, model, seed, path):
     logging.info('Reconstructing %s seed=%d from %s', model, seed, path)
     state = torch.load(path, map_location='cpu', weights_only=False)
     config = checkpoint_config(state, path, model, seed, spec, out)
-    init_seed(seed, config['reproducibility'])
-    if model == 'DGCDR':
-        dataset = create_dataset(config)
-        train, valid, test = data_preparation(config, dataset)
-        target = train.target_dataset
-        source = train.source_dataset
-        model_dataset = train.dataset
-    else:
-        dataset = create_light_dataset(config)
-        train, valid, test = prepare_light_data(config, dataset)
-        target = train.dataset
-        source = None
-        model_dataset = target
+    train, valid, test, target, source, model_dataset = reconstruct_data(config, model, seed)
     datasets = {'train': target, 'validation': valid.dataset, 'test': test.dataset}
     splits = {name: token_pairs(data) for name, data in datasets.items()}
     if splits['train'] & splits['validation'] or splits['train'] & splits['test'] or splits['validation'] & splits['test']:
         raise ValueError(f'{model}/{seed}: target split overlap')
     candidates = set(token_map(target, target.iid_field).values()) - {'[PAD]'}
-    init_seed(seed, config['reproducibility'])
-    predictor = (DGCDR(config, model_dataset) if model == 'DGCDR'
-                 else LightGCN(config, model_dataset)).to(config['device'])
-    predictor.load_state_dict(state['state_dict'])
-    if state.get('other_parameter') is not None:
-        predictor.load_other_parameter(state['other_parameter'])
+    predictor = load_predictor(state, config, model, model_dataset, reseed=seed)
     matrix = predictor.target_interaction_matrix if model == 'DGCDR' else predictor.interaction_matrix
     if set(zip(matrix.row.tolist(), matrix.col.tolist())) != pairs(target):
         raise ValueError(f'{model}/{seed}: model graph differs from reconstructed training data')
@@ -608,6 +531,7 @@ def main():
             results[(name,seed)] = reconstruct(spec, out, name, seed, paths[(name, seed)])
         light, dgcdr = results[('LightGCN', seed)], results[('DGCDR', seed)]
         compare_pair(seed, light, dgcdr)
+        validate_transfer_preparation(spec, out, seed, paths[('DGCDR', seed)], dgcdr)
         audits[str(seed)] = dict(train=len(light['splits']['train']),
                                 validation=len(light['splits']['validation']),
                                 test=len(light['splits']['test']), test_users=len(light['results']),

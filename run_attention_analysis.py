@@ -11,7 +11,6 @@ Only load checkpoint files produced by a trusted local training run.
 """
 
 import argparse
-import hashlib
 import json
 import logging
 from pathlib import Path
@@ -19,6 +18,12 @@ import sys
 
 import numpy as np
 import pandas as pd
+
+from analysis_common import (
+    path_from_root, read_reference, resolve_checkpoints, token_map as live_token_map,
+    distinct_counts, sha256_file, attention_checkpoint_config, reconstruct_data,
+    load_predictor, prepared_seed_check, token_pairs,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -34,11 +39,6 @@ USER_FIELDS = [
 ZERO_NORM_TOL = 1e-12
 
 
-def path_from_root(value):
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else ROOT / path).resolve()
-
-
 def write_csv_atomic(path, frame, fields):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + '.tmp')
@@ -51,93 +51,6 @@ def write_text_atomic(path, content):
     temp = path.with_suffix(path.suffix + '.tmp')
     temp.write_text(content, encoding='utf-8')
     temp.replace(path)
-
-
-def read_reference(analysis):
-    metadata = json.loads((analysis / 'config.json').read_text(encoding='utf-8'))
-    seeds = [int(seed) for seed in metadata['spec']['seeds']]
-    if not seeds or len(set(seeds)) != len(seeds):
-        raise ValueError('Missing or duplicated reference seeds')
-    required = {'user_id', 'seed', 'n_source_train', 'n_target_train'}
-    frame = pd.read_csv(analysis / 'per_user.csv', dtype={'user_id': str})
-    if not required.issubset(frame.columns):
-        raise ValueError('Reference per_user.csv is missing required columns')
-    if frame[list(required)].isna().any().any() or frame.duplicated(['user_id', 'seed']).any():
-        raise ValueError('Reference contains null fields or duplicate user/seed pairs')
-    coverage = frame.groupby('user_id').seed.agg(['size', 'nunique'])
-    if set(frame.seed) != set(seeds) or not coverage.eq(len(seeds)).all().all():
-        raise ValueError('Reference has incomplete or unexpected seeds')
-    for name in ('n_source_train', 'n_target_train'):
-        values = pd.to_numeric(frame[name], errors='raise').to_numpy(dtype=float)
-        if not np.isfinite(values).all() or (values < 0).any() or not np.equal(values, np.floor(values)).all():
-            raise ValueError('Invalid training counts in reference: ' + name)
-    return metadata, frame, seeds
-
-
-def resolve_checkpoints(metadata, seeds, overrides, checkpoint_dir):
-    explicit = {}
-    for entry in overrides:
-        try:
-            seed_text, filename = entry.split('=', 1)
-            seed = int(seed_text)
-        except ValueError as exc:
-            raise ValueError('Use --checkpoint SEED=PATH') from exc
-        if seed not in seeds or seed in explicit:
-            raise ValueError('Unexpected or duplicated explicit seed: ' + str(seed))
-        explicit[seed] = path_from_root(filename)
-    directory = path_from_root(checkpoint_dir) if checkpoint_dir else None
-    paths = {}
-    for seed in seeds:
-        if seed in explicit:
-            path = explicit[seed]
-        elif directory:
-            matches = [candidate for candidate in directory.rglob('DGCDR-*.pth')
-                       if candidate.parent.name == str(seed)]
-            if len(matches) != 1:
-                raise ValueError('Expected one DGCDR checkpoint for seed %s in %s; found %s. '
-                                 'Use --checkpoint SEED=PATH.' % (seed, directory, matches))
-            path = matches[0].resolve()
-        else:
-            recorded = Path(metadata['seeds'][str(seed)]['checkpoints']['DGCDR'])
-            if recorded.is_file():
-                path = recorded.resolve()
-            else:
-                raise FileNotFoundError('Missing DGCDR checkpoint for seed %s: %s. '
-                                        'Supply --checkpoint-dir or --checkpoint.' % (seed, recorded))
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        paths[seed] = path
-    if len(set(paths.values())) != len(paths):
-        raise ValueError('The same checkpoint is assigned to multiple seeds')
-    return paths
-
-
-def live_token_map(dataset, field):
-    mapping = dataset.field2token_id[field]
-    reverse = {int(index): str(token) for token, index in mapping.items()}
-    if len(reverse) != len(mapping):
-        raise ValueError('Non-unique token mapping for ' + field)
-    return reverse
-
-
-def distinct_counts(matrix):
-    """Count distinct item IDs for each user in a sparse training graph."""
-    if matrix.nnz == 0:
-        return np.zeros(matrix.shape[0], dtype=np.int64)
-    order = np.lexsort((matrix.col, matrix.row))
-    rows, cols = matrix.row[order], matrix.col[order]
-    unique = np.empty(len(rows), dtype=bool)
-    unique[0] = True
-    unique[1:] = (rows[1:] != rows[:-1]) | (cols[1:] != cols[:-1])
-    return np.bincount(rows[unique], minlength=matrix.shape[0])
-
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as source:
-        for chunk in iter(lambda: source.read(8 * 1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def channel_measurements(g_target, c_target, s_target, c_source, torch):
@@ -159,47 +72,21 @@ def channel_measurements(g_target, c_target, s_target, c_source, torch):
     return attention, cosine
 
 
-def extract_seed(seed, path, reference, source, target, data_root, device_name, scratch):
+def extract_seed(seed, path, reference, source, target, data_root, device_name, scratch,
+                 prepared_metadata=None):
     # Keep all model dependencies out of the report-only path.
     import torch
-    from recbole.utils import init_seed
-    from recbole_cdr.data import create_dataset, data_preparation
-    from recbole_cdr.model.cross_domain_recommender.dgcdr import DGCDR
-
     state = torch.load(path, map_location='cpu', weights_only=False)
-    config = state['config']
-    if config['model'] != 'DGCDR' or int(config['seed']) != seed:
-        raise ValueError('%s has the wrong model or seed' % path)
-    if config['source_domain']['dataset'] != source or config['target_domain']['dataset'] != target:
-        raise ValueError('%s has the wrong source/target domains' % path)
-    if not config['preference_disentangle'] or config['fuse_mode'] != 'attention':
-        raise ValueError('%s does not use user disentanglement with attention' % path)
-    if config['attention_mode'] not in ('all', 'part'):
-        raise ValueError('Unsupported attention_mode in ' + str(path))
-    if device_name == 'auto':
-        device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device_name == 'cuda' and not torch.cuda.is_available():
-        raise ValueError('CUDA requested but not available')
-    device = torch.device(device_name)
-    for domain in ('source', 'target'):
-        dataset_name = config[domain + '_domain']['dataset']
-        location = data_root / dataset_name
-        if not location.is_dir():
-            raise FileNotFoundError(location)
-        config[domain + '_domain']['data_path'] = str(location)
-    config['device'] = device
-    config['use_gpu'] = device.type == 'cuda'
-    config['checkpoint_dir'] = str(scratch / str(seed))
-    config['dataloaders_save_path'] = None
-    config['save_dataloaders'] = False
-    config['save_dataset'] = False
-    init_seed(seed, config['reproducibility'])
-    dataset = create_dataset(config)
-    train, _, _ = data_preparation(config, dataset)
-    predictor = DGCDR(config, train.dataset).to(device)
-    predictor.load_state_dict(state['state_dict'])
-    if state.get('other_parameter') is not None:
-        predictor.load_other_parameter(state['other_parameter'])
+    config = attention_checkpoint_config(state, path, seed, source, target,
+                                         data_root, device_name, scratch)
+    device = config['device']
+    train, valid, test, target_data, _, model_dataset = reconstruct_data(config, 'DGCDR', seed)
+    if prepared_metadata is not None:
+        splits = {name: token_pairs(dataset) for name, dataset in (
+            ('train', target_data), ('validation', valid.dataset), ('test', test.dataset))}
+        splits['source_train'] = token_pairs(train.source_dataset)
+        prepared_seed_check(prepared_metadata, seed, path, splits)
+    predictor = load_predictor(state, config, 'DGCDR', model_dataset)
     predictor.eval()
 
     target_map = live_token_map(train.target_dataset, train.target_dataset.uid_field)
@@ -337,7 +224,8 @@ def generate_report(summary, labels, metadata, analysis):
         '# Attention DGCDR: %s → %s' % (spec['source'], spec['target']),
         '',
         'Analisi di checkpoint DGCDR già addestrati; nessun nuovo training. '
-        'Utenti del confronto originale: **%d**. Seed: %s.' % (len(summary), seeds),
+        + ('Utenti test target: **%d**. Seed: %s.' if metadata['reference'].get('kind') == 'dgcdr_preparation'
+           else 'Utenti del confronto originale: **%d**. Seed: %s.') % (len(summary), seeds),
         '',
         'Per ogni utente si calcola prima la media sui seed. Ogni fascia è poi la media '
         'dei propri utenti: ciascun utente pesa una volta.',
@@ -373,7 +261,9 @@ def generate_report(summary, labels, metadata, analysis):
         '',
         '[Tutti gli utenti](per_user.csv) · '
         '[Dettaglio utente × seed](per_user_seed.csv) · '
-        '[Report del confronto originale](../report.md).',
+        + ('[Preparazione dell’esperimento](../preparation/config.json).'
+           if metadata['reference'].get('kind') == 'dgcdr_preparation'
+           else '[Report del confronto originale](../report.md).'),
         '',
         'Dati e split sono stati ricostruiti dai checkpoint con il protocollo '
         'dell’analisi originale; in assenza dei dataloader storici, i soli pesi '
@@ -420,6 +310,10 @@ def extract(analysis, output, args):
     source = metadata['spec']['source']
     target = metadata['spec']['target']
     checkpoint_paths = resolve_checkpoints(metadata, seeds, args.checkpoint, args.checkpoint_dir)
+    prepared_metadata = None
+    if metadata.get('reference_kind') == 'dgcdr_preparation':
+        prepared_metadata = metadata
+    data_root = path_from_root(args.data_root or metadata.get('data_root', str(ROOT / 'dataset')))
     rows, checks = [], {}
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -427,7 +321,8 @@ def extract(analysis, output, args):
         logging.info('Extracting seed %s from %s', seed, checkpoint_paths[seed])
         result, check = extract_seed(
             seed, checkpoint_paths[seed], reference[reference.seed == seed].copy(),
-            source, target, path_from_root(args.data_root), args.device, output / '_scratch')
+            source, target, data_root, args.device, output / '_scratch',
+            prepared_metadata=prepared_metadata)
         rows.append(result)
         checks[str(seed)] = check
         logging.info('Seed %s: %d users', seed, len(result))
@@ -440,21 +335,23 @@ def extract(analysis, output, args):
         'reference': {'analysis': str(analysis), 'spec': {'source': source, 'target': target},
                       'seeds': seeds, 'reference_rows': len(reference)},
         'extraction': {'zero_norm_tolerance': ZERO_NORM_TOL,
-                       'data_root': str(path_from_root(args.data_root)),
+                       'data_root': str(data_root),
                        'checkpoint_checks': checks},
     }
+    if prepared_metadata is not None:
+        record['reference']['kind'] = 'dgcdr_preparation'
     write_csv_atomic(output / 'per_user_seed.csv', details, SEED_FIELDS)
     write_text_atomic(output / 'config.json', json.dumps(record, indent=2, ensure_ascii=False) + '\n')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--analysis', required=True, help='Directory containing the reference config.json/per_user.csv')
+    parser.add_argument('--analysis', required=True, help='Experiment directory with transfer results or preparation/config.json and preparation/users.csv')
     parser.add_argument('--output', help='Attention output directory (default: ANALYSIS/attention)')
     parser.add_argument('--stage', choices=['all', 'extract', 'report'], default='all')
     parser.add_argument('--checkpoint-dir', help='Directory with DGCDR checkpoints, optionally grouped by seed')
     parser.add_argument('--checkpoint', action='append', default=[], metavar='SEED=PATH')
-    parser.add_argument('--data-root', default=str(ROOT / 'dataset'), help='Root containing the source/target dataset folders')
+    parser.add_argument('--data-root', help='Dataset root (default: saved preparation path, otherwise PROJECT/dataset)')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--threads', type=int, default=4)
     args = parser.parse_args()
