@@ -279,6 +279,25 @@ def transfer_classes(lightgcn, dgcdr):
         ['NDCG@20 nullo', 'Positive', 'Negative'], default='Neutral')
 
 
+def transfer_activity_row(source_bin, target_bin, group):
+    """Summarize one population from unrounded per-user seed means."""
+    neg = group[group['class'] == 'Negative']
+    pos = group[group['class'] == 'Positive']
+    mean_lightgcn = group.ndcg_lightgcn.mean()
+    neg_lightgcn = neg.ndcg_lightgcn.mean()
+    pos_lightgcn = pos.ndcg_lightgcn.mean()
+    loss_pct = ('%.2f%%' % (-100 * neg.delta_ndcg.mean() / neg_lightgcn)
+                if len(neg) and neg_lightgcn else 'n/d')
+    gain_pct = ('%.2f%%' % (100 * pos.delta_ndcg.mean() / pos_lightgcn)
+                if len(pos) and pos_lightgcn else 'n/d')
+    relative_delta = ('%.2f%%' % (100 * group.delta_ndcg.mean() / mean_lightgcn)
+                      if mean_lightgcn else 'n/d')
+    return [source_bin, target_bin, len(group),
+            '%.2f%%' % (100 * (group['class'] == 'Negative').mean()),
+            '%.2f%%' % (100 * (group['class'] == 'Positive').mean()),
+            loss_pct, gain_pct, relative_delta]
+
+
 def report(spec, out):
     import pandas as pd
     df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
@@ -348,7 +367,12 @@ def report(spec, out):
              'Analisi di checkpoint già addestrati; nessun training o tuning.\n',
              'Ogni coppia DGCDR/LightGCN usa lo stesso split target ricostruito dal seed. '
              'Gli split possono cambiare fra seed. Checkpoint selezionati in origine con Recall@20 validation. '
-             'repeatable=%s; soglie salvate nei checkpoint: DGCDR %s, LightGCN %s.\n' % (
+             'repeatable=%s.\n\n'
+             'La rilevanza è basata sulla presenza dell’interazione. '
+             'Il parametro `threshold` salvato nei checkpoint (DGCDR %s, LightGCN %s) '
+             'genera etichette binarie, ma non filtra le interazioni; tali etichette '
+             'non vengono utilizzate dal training BPR né per selezionare i positivi '
+             'nella valutazione full-ranking.\n' % (
                  repeatable, threshold_dgcdr, threshold_lightgcn),
              'Train target: **%s**. Validation target: **%s**. Test target: **%s**. '
              'Utenti test distinti: **%d**. Seed: %s.\n' % (
@@ -445,26 +469,17 @@ def report(spec, out):
                  '\n  $$\n\n'
                  'La quota restante dopo Negative e Positive comprende Neutral e NDCG@20 nullo. '
                  'Tutte le classi sono incluse in Utenti e nei denominatori delle percentuali di classe.\n\n'
+                 'La riga “Tutti gli utenti” usa l’intera popolazione analizzata: prima si '
+                 'calcola la media sui seed per utente, poi ogni utente pesa una volta. '
+                 'Le misure sono ricalcolate sui valori individuali non arrotondati: '
+                 'P̄ sui soli Negative, Ḡ sui soli Positive e Delta su tutti gli utenti.\n\n'
                  '**n/d** indica che la classe corrispondente è vuota oppure che la media '
                  'LightGCN usata come denominatore è zero.\n')
     cells = []
     for (s,t), group in summary.groupby(['source_bin','target_bin']):
-        neg = group[group['class']=='Negative']
-        pos = group[group['class']=='Positive']
-        mean_lightgcn = group.ndcg_lightgcn.mean()
-        neg_lightgcn = neg.ndcg_lightgcn.mean()
-        pos_lightgcn = pos.ndcg_lightgcn.mean()
-        loss_pct = ('%.2f%%' % (-100 * neg.delta_ndcg.mean() / neg_lightgcn)
-                    if len(neg) and neg_lightgcn else 'n/d')
-        gain_pct = ('%.2f%%' % (100 * pos.delta_ndcg.mean() / pos_lightgcn)
-                    if len(pos) and pos_lightgcn else 'n/d')
-        relative_delta = ('%.2f%%' % (100 * group.delta_ndcg.mean() / mean_lightgcn)
-                          if mean_lightgcn else 'n/d')
-        cells.append([s,t,len(group),
-                      '%.2f%%'%(100*(group['class']=='Negative').mean()),
-                      '%.2f%%'%(100*(group['class']=='Positive').mean()),
-                      loss_pct,gain_pct,
-                      relative_delta])
+        cells.append(transfer_activity_row(s, t, group))
+    cells.append(['**%s**' % value for value in
+                  transfer_activity_row('Tutti gli utenti', '—', summary)])
     lines.append(table(['Fascia S','Fascia T','Utenti','Negative',
                         'Positive','P̄ (%)','Ḡ (%)','Delta (%)'],cells))
     lines.extend([

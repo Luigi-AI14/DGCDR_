@@ -202,22 +202,26 @@ def generate_report(summary, labels, metadata, analysis):
     spec = metadata['reference']['spec']
     seeds = metadata['reference']['seeds']
     grouped = summary.groupby(['source_bin', 'target_bin'], sort=True)
+
+    def measurements(group):
+        return ['%.2f%%' % (100 * group.attention_shared_target_mean.mean()),
+                '%.2f%%' % (100 * group.attention_specific_target_mean.mean()),
+                '%.4f' % group.shared_similarity_st_mean.mean()]
+
     rows = []
     for source_bin in range(len(labels['source'])):
         for target_bin in range(len(labels['target'])):
             key = (source_bin, target_bin)
             group = grouped.get_group(key) if key in grouped.groups else None
             rows.append([source_bin, target_bin, 0 if group is None else len(group), *(
-                ['n/d'] * 3 if group is None else [
-                    '%.6f' % group[column].mean() if column != 'shared_similarity_st_mean'
-                    else '%.4f' % group[column].mean() for column in (
-                        'attention_shared_target_mean', 'attention_specific_target_mean',
-                        'shared_similarity_st_mean')])])
+                ['n/d'] * 3 if group is None else measurements(group))])
+    rows.append(['**%s**' % value for value in
+                 ['Tutti gli utenti', '—', len(summary), *measurements(summary)]])
     sample = summary.sort_values('user_id', kind='stable').head(10)
     sample_rows = [[row.user_id, format_count(row.n_source_train_mean),
                     format_count(row.n_target_train_mean),
-                    '%.6f' % row.attention_shared_target_mean,
-                    '%.6f' % row.attention_specific_target_mean,
+                    '%.2f%%' % (100 * row.attention_shared_target_mean),
+                    '%.2f%%' % (100 * row.attention_specific_target_mean),
                     '%.4f' % row.shared_similarity_st_mean]
                    for row in sample.itertuples(index=False)]
     lines = [
@@ -228,10 +232,13 @@ def generate_report(summary, labels, metadata, analysis):
            else 'Utenti del confronto originale: **%d**. Seed: %s.') % (len(summary), seeds),
         '',
         'Per ogni utente si calcola prima la media sui seed. Ogni fascia è poi la media '
-        'dei propri utenti: ciascun utente pesa una volta.',
+        'dei propri utenti: ciascun utente pesa una volta. La riga “Tutti gli utenti” '
+        'è la media dell’intera popolazione analizzata, con lo stesso peso per ciascun '
+        'utente, calcolata sui valori individuali non arrotondati.',
         '',
         'L’attenzione shared e specific è calcolata sulla rappresentazione utente target; '
-        'i due pesi sommano a 1. Indicano come DGCDR bilancia i due canali, non la '
+        'i due pesi sono espressi in percentuale e sommano al 100%. '
+        'Indicano come DGCDR bilancia i due canali, non la '
         'percentuale di informazione proveniente dal source. La similarità shared S–T '
         'confronta la direzione dei vettori shared dello stesso utente nei due domini: '
         'valori vicini a 1 indicano maggiore allineamento, vicini a 0 poco allineamento. '
