@@ -49,6 +49,7 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     source_domain = data.get("source_domain", "")
     target_domain = data.get("target_domain", "")
     model = data.get("model", "Unknown")
+    prompt_version = data.get("prompt_version")
     sbert_model = data.get("sbert_model", "N/A")
     timestamp = data.get("timestamp", "N/A")
     seed = data.get("seed", "N/A")
@@ -66,6 +67,10 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     has_sbert = "macro_avg_sbert_similarity" in global_avg or any(
         "avg_sbert_similarity" in u.get("user_averages", {}) for u in users
     )
+    has_bertscore = "macro_avg_bertscore_r" in global_avg or any(
+        "avg_bertscore_r" in u.get("user_averages", {}) for u in users
+    )
+    bertscore_model = data.get("bertscore_model", "roberta-large")
 
     md = []
     # Title & Metadata
@@ -78,7 +83,13 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     md.append("|:---|:---|")
     md.append(f"| **Domain Pair** | `{domain_pair}` ({source_domain} &rarr; {target_domain}) |")
     md.append(f"| **LLM Model** | `{model}` |")
+    if prompt_version:
+        md.append(f"| **Prompt Version** | `{prompt_version}` |")
     md.append(f"| **Sentence-BERT Model** | `{sbert_model}` |")
+    rescale_baseline = data.get("bertscore_rescale_with_baseline", True)
+    if has_bertscore and bertscore_model:
+        rescale_str = " (Rescaled with Baseline)" if rescale_baseline else " (Raw)"
+        md.append(f"| **BERTScore Model** | `{bertscore_model}`{rescale_str} |")
     md.append(f"| **Random Seed** | `{seed}` |")
     md.append(f"| **Sampling Temperature** | `{temp}` |")
     md.append(f"| **Rating Threshold** | `&ge; {threshold}` |")
@@ -96,6 +107,11 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     md.append(f"| **ROUGE-L (F1)** | `{_format_score(global_avg.get('macro_avg_rougeL_f1'))}` | Longest common subsequence |")
     if has_sbert:
         md.append(f"| **SBERT Similarity** | `{_format_score(global_avg.get('macro_avg_sbert_similarity'))}` | Semantic cosine similarity (Sentence-BERT) |")
+    if has_bertscore:
+        rescale_note = " (rescaled with baseline)" if rescale_baseline else ""
+        md.append(f"| **BERTScore (Recall)** | `{_format_score(global_avg.get('macro_avg_bertscore_r'))}` | Semantic token coverage of user review{rescale_note} |")
+        md.append(f"| **BERTScore (F1)** | `{_format_score(global_avg.get('macro_avg_bertscore_f1'))}` | Harmonic mean of token-level semantic match{rescale_note} |")
+        md.append(f"| **BERTScore (Precision)** | `{_format_score(global_avg.get('macro_avg_bertscore_p'))}` | Grounding of explanation tokens in user review{rescale_note} |")
     md.append("")
 
     # Stratified Quintile Metrics (if present)
@@ -105,6 +121,8 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
         q_cols = ["Quintile", "Label", "Word Range", "Count", "% Valid", "Avg Words", "BLEU", "ROUGE-1", "ROUGE-2", "ROUGE-L"]
         if has_sbert:
             q_cols.append("SBERT Sim")
+        if has_bertscore:
+            q_cols.extend(["BERT-R", "BERT-F1"])
         
         md.append("| " + " | ".join(q_cols) + " |")
         md.append("|" + "|".join([":---" if i < 3 else ":---:" for i in range(len(q_cols))]) + "|")
@@ -127,6 +145,9 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
                 ]
                 if has_sbert:
                     row.append(_format_score(q.get("avg_sbert_similarity")))
+                if has_bertscore:
+                    row.append(_format_score(q.get("avg_bertscore_r")))
+                    row.append(_format_score(q.get("avg_bertscore_f1")))
                 md.append("| " + " | ".join(row) + " |")
 
         # Summary rows
@@ -148,6 +169,9 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
             ]
             if has_sbert:
                 valid_row.append(_format_score(macro_valid.get("macro_avg_sbert_similarity")))
+            if has_bertscore:
+                valid_row.append(_format_score(macro_valid.get("macro_avg_bertscore_r")))
+                valid_row.append(_format_score(macro_valid.get("macro_avg_bertscore_f1")))
             md.append("| " + " | ".join(valid_row) + " |")
 
         md.append("")
@@ -159,6 +183,8 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     user_cols = ["#", "User ID", "Items", "Avg BLEU", "Avg ROUGE-1", "Avg ROUGE-2", "Avg ROUGE-L"]
     if has_sbert:
         user_cols.append("Avg SBERT Sim")
+    if has_bertscore:
+        user_cols.extend(["Avg BERT-R", "Avg BERT-F1"])
     md.append("| " + " | ".join(user_cols) + " |")
     md.append("|" + "|".join([":---:" if i == 0 or i == 2 else (":---" if i == 1 else ":---:") for i in range(len(user_cols))]) + "|")
 
@@ -177,6 +203,9 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
         ]
         if has_sbert:
             row.append(_format_score(u_avgs.get("avg_sbert_similarity")))
+        if has_bertscore:
+            row.append(_format_score(u_avgs.get("avg_bertscore_r")))
+            row.append(_format_score(u_avgs.get("avg_bertscore_f1")))
         md.append("| " + " | ".join(row) + " |")
     md.append("")
 
@@ -199,6 +228,8 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
         )
         if has_sbert:
             avg_line += f" | SBERT: `{_format_score(u_avgs.get('avg_sbert_similarity'))}`"
+        if has_bertscore:
+            avg_line += f" | BERT-R: `{_format_score(u_avgs.get('avg_bertscore_r'))}` | BERT-F1: `{_format_score(u_avgs.get('avg_bertscore_f1'))}`"
         md.append(avg_line)
         md.append("")
 
@@ -224,6 +255,8 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
             )
             if has_sbert and "sbert_similarity" in m:
                 it_metric_line += f" | SBERT Sim: `{_format_score(m.get('sbert_similarity'))}`"
+            if has_bertscore and "bertscore_r" in m:
+                it_metric_line += f" | BERT-R: `{_format_score(m.get('bertscore_r'))}` | BERT-F1: `{_format_score(m.get('bertscore_f1'))}`"
             md.append(it_metric_line)
             md.append("")
 

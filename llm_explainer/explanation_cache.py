@@ -27,18 +27,28 @@ class ExplanationCache:
         self,
         domain_pair: str,
         model_name: str,
+        prompt_version: str = "v2",
         cache_dir: Optional[str] = None,
         results_dir: Optional[str] = None,
     ):
         self.domain_pair = domain_pair
         self.model_name = model_name
         self.clean_model = sanitize_model_name(model_name)
+        self.prompt_version = (prompt_version or "").strip()
+        self.clean_version = sanitize_model_name(self.prompt_version) if self.prompt_version else ""
+        self.is_v1 = not self.clean_version or self.clean_version.lower() == "v1"
         self.cache_dir = cache_dir or os.path.join(BASE_DIR, "cache", "explanations")
         self.results_dir = results_dir or os.path.join(BASE_DIR, "results")
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.cache_file = os.path.join(
-            self.cache_dir, f"expl_{self.domain_pair}_{self.clean_model}.pkl"
-        )
+        
+        if not self.is_v1:
+            self.cache_file = os.path.join(
+                self.cache_dir, f"expl_{self.domain_pair}_{self.clean_model}_{self.clean_version}.pkl"
+            )
+        else:
+            self.cache_file = os.path.join(
+                self.cache_dir, f"expl_{self.domain_pair}_{self.clean_model}.pkl"
+            )
         # Internal store: user_id -> {item_id: explanation_string}
         self._cache: Dict[str, Dict[str, str]] = {}
         self._dirty = False
@@ -67,9 +77,13 @@ class ExplanationCache:
         """
         Scans previous run results in results/ to pre-populate the cache with existing explanations.
         Filters strictly for runs with temperature=0.0 and generated on or after 2026-09-28
-        to avoid importing legacy runs that used different temperatures or prompts.
+        matching the specific prompt_version to avoid mixing explanations across prompt versions.
         """
-        model_dir = os.path.join(self.results_dir, self.domain_pair, self.clean_model)
+        if not self.is_v1:
+            model_dir = os.path.join(self.results_dir, self.domain_pair, f"{self.clean_model}_{self.clean_version}")
+        else:
+            model_dir = os.path.join(self.results_dir, self.domain_pair, self.clean_model)
+
         if not os.path.exists(model_dir):
             return
 
@@ -95,6 +109,15 @@ class ExplanationCache:
                 if data.get("temperature") != 0.0:
                     continue
 
+                # Verify matching prompt_version
+                file_ver = data.get("prompt_version")
+                if self.is_v1:
+                    if file_ver not in (None, "", "v1"):
+                        continue
+                else:
+                    if file_ver != self.prompt_version:
+                        continue
+
                 users = data.get("users", [])
                 for u in users:
                     uid = u.get("user_id")
@@ -113,7 +136,7 @@ class ExplanationCache:
 
         if imported_count > 0:
             logger.info(
-                f"Auto-imported {imported_count} verified explanations (temp=0.0, >= 2026-09-28) from {model_dir}"
+                f"Auto-imported {imported_count} verified explanations (temp=0.0, prompt_version={self.prompt_version or 'v1'}) from {model_dir}"
             )
             self.save()
 

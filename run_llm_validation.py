@@ -27,6 +27,7 @@ from llm_explainer.explanation_cache import ExplanationCache
 from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
 from llm_explainer.metrics import (
     ReferenceEmbeddingCache,
+    batch_compute_bert_score,
     batch_compute_candidate_embeddings,
     batch_compute_cosine_similarities,
     compute_syntactic_metrics,
@@ -94,6 +95,13 @@ def parse_args():
         help="Ollama model name (default: qwen3.5:9b).",
     )
     parser.add_argument(
+        "--prompt_version",
+        "-pv",
+        type=str,
+        default=DEFAULT_SETTINGS.get("prompt_version", "v2"),
+        help="Prompt version identifier (default: v2 for pragmatic real-world prompt, v1 for baseline).",
+    )
+    parser.add_argument(
         "--ollama_url",
         type=str,
         default=DEFAULT_SETTINGS["ollama_url"],
@@ -157,6 +165,35 @@ def parse_args():
         help="Disable loading cached LLM explanations and force fresh generation via Ollama.",
     )
     parser.add_argument(
+        "--bertscore_model",
+        type=str,
+        default=DEFAULT_SETTINGS.get("bertscore_model", "roberta-large"),
+        help="Hugging Face model identifier for BERTScore (default: roberta-large).",
+    )
+    parser.add_argument(
+        "--bertscore_batch_size",
+        type=int,
+        default=DEFAULT_SETTINGS.get("bertscore_batch_size", 16),
+        help="Batch size for BERTScore token encoding (default: 16).",
+    )
+    parser.add_argument(
+        "--no_bertscore",
+        action="store_true",
+        help="Disable computation of BERTScore metrics.",
+    )
+    parser.add_argument(
+        "--bertscore_rescale_baseline",
+        action="store_true",
+        default=DEFAULT_SETTINGS.get("bertscore_rescale_with_baseline", True),
+        help="Rescale BERTScore using empirical baselines (default: True).",
+    )
+    parser.add_argument(
+        "--no_bertscore_rescale_baseline",
+        action="store_false",
+        dest="bertscore_rescale_baseline",
+        help="Disable baseline rescaling for BERTScore (use raw scores).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
@@ -193,11 +230,15 @@ def main():
     print(f"Seed:                {args.seed}")
     print(f"Temperature:         {args.temperature}")
     print(f"Rating Threshold:    >= {args.rating_threshold}")
+    print(f"Prompt Version:      {args.prompt_version}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"SBERT Batch Size:    {args.sbert_batch_size}")
     print(f"SBERT Max Seq Len:   {args.sbert_max_seq_length} tokens")
     print(f"SBERT Cache Enabled: {not args.no_cache_sbert}")
+    print(f"BERTScore Model:     {args.bertscore_model if not args.no_bertscore else 'Disabled'}")
+    print(f"BERTScore Batch Size:{args.bertscore_batch_size}")
+    print(f"BERTScore Rescaled:  {args.bertscore_rescale_baseline if not args.no_bertscore else 'N/A'}")
     print(f"LLM Cache Enabled:   {not args.no_cache_llm}")
     print(f"Context Window:      {args.num_ctx} tokens")
     print(f"Quintile Min Words:  >= {args.min_review_words} words (excluding < {args.min_review_words})")
@@ -239,10 +280,11 @@ def main():
     expl_cache = ExplanationCache(
         domain_pair=args.domain_pair,
         model_name=args.model,
+        prompt_version=args.prompt_version,
     )
     if not args.no_cache_llm:
         logger.info(
-            f"LLM Explanation Cache active: {expl_cache.total_explanations} explanations "
+            f"LLM Explanation Cache active ({expl_cache.cache_file}): {expl_cache.total_explanations} explanations "
             f"for {expl_cache.total_users} users available on disk."
         )
     else:
@@ -267,15 +309,20 @@ def main():
         sys.exit(1)
 
     # Prepare output filenames and dedicated run prompt directory
-    # Format: "dominio source"-"dominio target"_"Nome LLM"_"data e ora" (e.g. Cloth-Elec_qwen3.5_9b_20260926_120411)
+    # Format: "dominio source"-"dominio target"_"Nome LLM"[_version]_"data e ora"
     run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     clean_model = sanitize_model_name(args.model)
-    output_basename = f"{args.domain_pair}_{clean_model}_{run_timestamp}"
+    clean_version = sanitize_model_name(args.prompt_version) if args.prompt_version else ""
+    is_v1 = not clean_version or clean_version.lower() == "v1"
+    version_suffix = "" if is_v1 else f"_{clean_version}"
+    model_folder = f"{clean_model}{version_suffix}"
+
+    output_basename = f"{args.domain_pair}_{model_folder}_{run_timestamp}"
     output_filename = f"{output_basename}.json"
     md_filename = f"{output_basename}.md"
 
-    # Separate results into domain-pair and model subfolders (e.g. results/Cloth-Elec/qwen3.5_9b/)
-    domain_model_output_dir = os.path.join(args.output_dir, args.domain_pair, clean_model)
+    # Separate results into domain-pair and model/version subfolders (e.g. results/Cloth-Elec/qwen3.5_9b_v2/)
+    domain_model_output_dir = os.path.join(args.output_dir, args.domain_pair, model_folder)
     os.makedirs(domain_model_output_dir, exist_ok=True)
     output_filepath = os.path.join(domain_model_output_dir, output_filename)
     md_filepath = os.path.join(domain_model_output_dir, md_filename)
@@ -317,6 +364,7 @@ def main():
             target_history=user["target_history"],
             recommended_items=recommended_for_prompt,
             prompts_dir=run_prompts_dir,
+            prompt_version=args.prompt_version,
         )
         logger.info(f"  Prompt generated and saved to: {prompt_file}")
 
@@ -379,8 +427,11 @@ def main():
                 candidate_text=explanation,
                 reference_text=ground_truth_text,
             )
-            # Placeholder for sbert_similarity (will be populated in batch evaluation)
+            # Placeholder for sbert_similarity and bertscore (will be populated in batch evaluation)
             metrics["sbert_similarity"] = 0.0
+            metrics["bertscore_p"] = 0.0
+            metrics["bertscore_r"] = 0.0
+            metrics["bertscore_f1"] = 0.0
 
             semantic_ref = format_reference_with_title(ground_truth_text, ground_truth_title)
 
@@ -415,7 +466,7 @@ def main():
                 "reference_text": semantic_ref,
             })
 
-        # User averages (syntactic for now, SBERT updated in batch step)
+        # User averages (syntactic for now, SBERT & BERTScore updated in batch step)
         avg_bleu = round(sum(user_bleu) / len(user_bleu), 4) if user_bleu else 0.0
         avg_r1 = round(sum(user_r1) / len(user_r1), 4) if user_r1 else 0.0
         avg_r2 = round(sum(user_r2) / len(user_r2), 4) if user_r2 else 0.0
@@ -431,6 +482,9 @@ def main():
                 "avg_rouge2_f1": avg_r2,
                 "avg_rougeL_f1": avg_rl,
                 "avg_sbert_similarity": 0.0,
+                "avg_bertscore_p": 0.0,
+                "avg_bertscore_r": 0.0,
+                "avg_bertscore_f1": 0.0,
             },
         }
         all_user_results.append(user_result)
@@ -513,14 +567,52 @@ def main():
         queue_entry = eval_items_queue[q_idx]
         queue_entry["item_record"]["metrics"]["sbert_similarity"] = sim
 
-    # Update user-level averages for SBERT
-    logger.info("\nUpdated User Averages with SBERT Similarity:")
+    # 6.5 Batch Semantic Evaluation (BERTScore via roberta-large)
+    if not args.no_bertscore:
+        logger.info("\n" + "=" * 80)
+        logger.info(f" BATCH SEMANTIC EVALUATION (BERTScore: {args.bertscore_model}) ")
+        logger.info("=" * 80)
+        bert_scores = batch_compute_bert_score(
+            candidate_texts=all_candidates,
+            reference_texts=all_references,
+            model_type=args.bertscore_model,
+            batch_size=args.bertscore_batch_size,
+            rescale_with_baseline=args.bertscore_rescale_baseline,
+        )
+        for q_idx, queue_entry in enumerate(eval_items_queue):
+            queue_entry["item_record"]["metrics"]["bertscore_p"] = bert_scores["precision"][q_idx]
+            queue_entry["item_record"]["metrics"]["bertscore_r"] = bert_scores["recall"][q_idx]
+            queue_entry["item_record"]["metrics"]["bertscore_f1"] = bert_scores["f1"][q_idx]
+
+        global_bert_p_scores = list(bert_scores["precision"])
+        global_bert_r_scores = list(bert_scores["recall"])
+        global_bert_f1_scores = list(bert_scores["f1"])
+    else:
+        global_bert_p_scores = []
+        global_bert_r_scores = []
+        global_bert_f1_scores = []
+
+    # Update user-level averages for SBERT & BERTScore
+    logger.info("\nUpdated User Averages with SBERT Similarity & BERTScore:")
     for u_res in all_user_results:
         u_sims = [it["metrics"]["sbert_similarity"] for it in u_res["items"]]
         u_avg_sbert = round(sum(u_sims) / len(u_sims), 4) if u_sims else 0.0
         u_res["user_averages"]["avg_sbert_similarity"] = u_avg_sbert
+
+        if not args.no_bertscore:
+            u_bp = [it["metrics"]["bertscore_p"] for it in u_res["items"]]
+            u_br = [it["metrics"]["bertscore_r"] for it in u_res["items"]]
+            u_bf1 = [it["metrics"]["bertscore_f1"] for it in u_res["items"]]
+            u_res["user_averages"]["avg_bertscore_p"] = round(sum(u_bp) / len(u_bp), 4) if u_bp else 0.0
+            u_res["user_averages"]["avg_bertscore_r"] = round(sum(u_br) / len(u_br), 4) if u_br else 0.0
+            u_res["user_averages"]["avg_bertscore_f1"] = round(sum(u_bf1) / len(u_bf1), 4) if u_bf1 else 0.0
+            bert_log_str = f" | BERTScore-R: {u_res['user_averages']['avg_bertscore_r']:.4f} | BERTScore-F1: {u_res['user_averages']['avg_bertscore_f1']:.4f}"
+        else:
+            bert_log_str = ""
+
         logger.info(
-            f"  User {u_res['user_id']} -> SBERT Sim: {u_avg_sbert:.4f} | BLEU: {u_res['user_averages']['avg_bleu']:.4f} | "
+            f"  User {u_res['user_id']} -> SBERT Sim: {u_avg_sbert:.4f}{bert_log_str} | "
+            f"BLEU: {u_res['user_averages']['avg_bleu']:.4f} | "
             f"ROUGE-1: {u_res['user_averages']['avg_rouge1_f1']:.4f} | ROUGE-L: {u_res['user_averages']['avg_rougeL_f1']:.4f}"
         )
 
@@ -530,6 +622,21 @@ def main():
     macro_r2 = round(sum(global_r2_scores) / len(global_r2_scores), 4) if global_r2_scores else 0.0
     macro_rl = round(sum(global_rl_scores) / len(global_rl_scores), 4) if global_rl_scores else 0.0
     macro_sbert = round(sum(global_sbert_scores) / len(global_sbert_scores), 4) if global_sbert_scores else 0.0
+
+    global_averages_dict = {
+        "macro_avg_bleu": macro_bleu,
+        "macro_avg_rouge1_f1": macro_r1,
+        "macro_avg_rouge2_f1": macro_r2,
+        "macro_avg_rougeL_f1": macro_rl,
+        "macro_avg_sbert_similarity": macro_sbert,
+    }
+    if not args.no_bertscore:
+        macro_bert_p = round(sum(global_bert_p_scores) / len(global_bert_p_scores), 4) if global_bert_p_scores else 0.0
+        macro_bert_r = round(sum(global_bert_r_scores) / len(global_bert_r_scores), 4) if global_bert_r_scores else 0.0
+        macro_bert_f1 = round(sum(global_bert_f1_scores) / len(global_bert_f1_scores), 4) if global_bert_f1_scores else 0.0
+        global_averages_dict["macro_avg_bertscore_p"] = macro_bert_p
+        global_averages_dict["macro_avg_bertscore_r"] = macro_bert_r
+        global_averages_dict["macro_avg_bertscore_f1"] = macro_bert_f1
 
     # 8. Stratified Metrics by Review Quintiles (excluding < min_review_words)
     valid_items = [it for it in all_evaluated_items if not it["is_filtered_ultrashort"]]
@@ -554,11 +661,14 @@ def main():
             q_r2 = round(sum(it["metrics"]["rouge2_f1"] for it in q_items) / cnt, 4)
             q_rl = round(sum(it["metrics"]["rougeL_f1"] for it in q_items) / cnt, 4)
             q_sbert = round(sum(it["metrics"]["sbert_similarity"] for it in q_items) / cnt, 4)
+            q_bert_p = round(sum(it["metrics"].get("bertscore_p", 0.0) for it in q_items) / cnt, 4) if not args.no_bertscore else 0.0
+            q_bert_r = round(sum(it["metrics"].get("bertscore_r", 0.0) for it in q_items) / cnt, 4) if not args.no_bertscore else 0.0
+            q_bert_f1 = round(sum(it["metrics"].get("bertscore_f1", 0.0) for it in q_items) / cnt, 4) if not args.no_bertscore else 0.0
         else:
             avg_w = 0.0
-            q_bleu = q_r1 = q_r2 = q_rl = q_sbert = 0.0
+            q_bleu = q_r1 = q_r2 = q_rl = q_sbert = q_bert_p = q_bert_r = q_bert_f1 = 0.0
 
-        quintile_breakdown[qid] = {
+        q_dict = {
             "label": label,
             "range_words": range_str,
             "min_words": min_w,
@@ -572,6 +682,12 @@ def main():
             "avg_rougeL_f1": q_rl,
             "avg_sbert_similarity": q_sbert,
         }
+        if not args.no_bertscore:
+            q_dict["avg_bertscore_p"] = q_bert_p
+            q_dict["avg_bertscore_r"] = q_bert_r
+            q_dict["avg_bertscore_f1"] = q_bert_f1
+
+        quintile_breakdown[qid] = q_dict
 
     macro_valid_bleu = round(sum(it["metrics"]["bleu"] for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
     macro_valid_r1 = round(sum(it["metrics"]["rouge1_f1"] for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
@@ -579,18 +695,24 @@ def main():
     macro_valid_rl = round(sum(it["metrics"]["rougeL_f1"] for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
     macro_valid_sbert = round(sum(it["metrics"]["sbert_similarity"] for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
 
+    macro_valid_metrics_dict = {
+        "macro_avg_bleu": macro_valid_bleu,
+        "macro_avg_rouge1_f1": macro_valid_r1,
+        "macro_avg_rouge2_f1": macro_valid_r2,
+        "macro_avg_rougeL_f1": macro_valid_rl,
+        "macro_avg_sbert_similarity": macro_valid_sbert,
+    }
+    if not args.no_bertscore:
+        macro_valid_metrics_dict["macro_avg_bertscore_p"] = round(sum(it["metrics"].get("bertscore_p", 0.0) for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
+        macro_valid_metrics_dict["macro_avg_bertscore_r"] = round(sum(it["metrics"].get("bertscore_r", 0.0) for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
+        macro_valid_metrics_dict["macro_avg_bertscore_f1"] = round(sum(it["metrics"].get("bertscore_f1", 0.0) for it in valid_items) / len(valid_items), 4) if valid_items else 0.0
+
     quintile_metrics = {
         "min_words_filter": args.min_review_words,
         "total_items_evaluated": len(all_evaluated_items),
         "valid_items_evaluated": len(valid_items),
         "filtered_ultrashort_items": len(filtered_items),
-        "macro_avg_valid_items": {
-            "macro_avg_bleu": macro_valid_bleu,
-            "macro_avg_rouge1_f1": macro_valid_r1,
-            "macro_avg_rouge2_f1": macro_valid_r2,
-            "macro_avg_rougeL_f1": macro_valid_rl,
-            "macro_avg_sbert_similarity": macro_valid_sbert,
-        },
+        "macro_avg_valid_items": macro_valid_metrics_dict,
         "by_quintile": quintile_breakdown,
     }
 
@@ -600,7 +722,10 @@ def main():
         "source_domain": users_data[0]["source_domain"],
         "target_domain": users_data[0]["target_domain"],
         "model": args.model,
+        "prompt_version": args.prompt_version,
         "sbert_model": args.sbert_model,
+        "bertscore_model": args.bertscore_model if not args.no_bertscore else None,
+        "bertscore_rescale_with_baseline": args.bertscore_rescale_baseline if not args.no_bertscore else None,
         "seed": args.seed,
         "temperature": args.temperature,
         "rating_threshold": args.rating_threshold,
@@ -610,13 +735,7 @@ def main():
         "total_held_out_items_evaluated": len(global_bleu_scores),
         "prompts_dir": run_prompts_dir,
         "users": all_user_results,
-        "global_averages": {
-            "macro_avg_bleu": macro_bleu,
-            "macro_avg_rouge1_f1": macro_r1,
-            "macro_avg_rouge2_f1": macro_r2,
-            "macro_avg_rougeL_f1": macro_rl,
-            "macro_avg_sbert_similarity": macro_sbert,
-        },
+        "global_averages": global_averages_dict,
         "quintile_metrics": quintile_metrics,
     }
 
@@ -631,38 +750,61 @@ def main():
     print("=" * 95)
     print(f"Total Users Evaluated:           {len(users_data)}")
     print(f"Total Held-Out Items Evaluated:  {len(global_bleu_scores)}")
+    print(f"Prompt Version:                  {args.prompt_version}")
     print(f"Macro Average BLEU:              {macro_bleu:.4f}")
     print(f"Macro Average ROUGE-1 (F1):      {macro_r1:.4f}")
     print(f"Macro Average ROUGE-2 (F1):      {macro_r2:.4f}")
     print(f"Macro Average ROUGE-L (F1):      {macro_rl:.4f}")
     print(f"Macro Average SBERT Similarity:  {macro_sbert:.4f}")
+    if not args.no_bertscore:
+        print(f"Macro Average BERTScore (Recall):{macro_bert_r:.4f}")
+        print(f"Macro Average BERTScore (F1):    {macro_bert_f1:.4f}")
+        print(f"Macro Average BERTScore (Prec):  {macro_bert_p:.4f}")
     print(f"Saved Results JSON:              {output_filepath}")
     print(f"Saved Results Markdown:          {md_filepath}")
     print(f"Saved Prompts Directory:         {run_prompts_dir}")
     print("=" * 95)
 
-    print("\n" + "=" * 95)
+    print("\n" + "=" * 105)
     print(f" EVALUATION METRICS STRATIFIED BY REVIEW QUINTILES (Min Words >= {args.min_review_words})")
-    print("=" * 95)
-    print(f"{'Quintile':<10} {'Label':<12} {'Range':<15} {'Count':<8} {'Avg Words':<11} {'BLEU':<10} {'ROUGE-1':<10} {'ROUGE-2':<10} {'ROUGE-L':<10} {'SBERT Sim':<10}")
-    print("-" * 95)
-    for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
-        qdata = quintile_breakdown[qid]
+    print("=" * 105)
+    if not args.no_bertscore:
+        print(f"{'Quintile':<10} {'Label':<12} {'Range':<15} {'Count':<7} {'Avg W':<7} {'BLEU':<8} {'ROUGE-1':<9} {'ROUGE-L':<9} {'SBERT':<8} {'BERT-R':<8} {'BERT-F1':<8}")
+        print("-" * 105)
+        for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
+            qdata = quintile_breakdown[qid]
+            print(
+                f"{qid:<10} {qdata['label']:<12} {qdata['range_words']:<15} {qdata['count']:<7} "
+                f"{qdata['avg_words']:<7.1f} {qdata['avg_bleu']:<8.4f} {qdata['avg_rouge1_f1']:<9.4f} "
+                f"{qdata['avg_rougeL_f1']:<9.4f} {qdata['avg_sbert_similarity']:<8.4f} "
+                f"{qdata.get('avg_bertscore_r', 0.0):<8.4f} {qdata.get('avg_bertscore_f1', 0.0):<8.4f}"
+            )
+        print("-" * 105)
         print(
-            f"{qid:<10} {qdata['label']:<12} {qdata['range_words']:<15} {qdata['count']:<8} "
-            f"{qdata['avg_words']:<11.1f} {qdata['avg_bleu']:<10.4f} {qdata['avg_rouge1_f1']:<10.4f} "
-            f"{qdata['avg_rouge2_f1']:<10.4f} {qdata['avg_rougeL_f1']:<10.4f} {qdata['avg_sbert_similarity']:<10.4f}"
+            f"{'Overall Valid':<38} {len(valid_items):<7} {'-':<7} "
+            f"{macro_valid_bleu:<8.4f} {macro_valid_r1:<9.4f} {macro_valid_rl:<9.4f} {macro_valid_sbert:<8.4f} "
+            f"{macro_valid_metrics_dict.get('macro_avg_bertscore_r', 0.0):<8.4f} {macro_valid_metrics_dict.get('macro_avg_bertscore_f1', 0.0):<8.4f}"
         )
-    print("-" * 95)
-    print(
-        f"{'Overall (Valid >= ' + str(args.min_review_words) + 'w)':<39} {len(valid_items):<8} "
-        f"{'-':<11} {macro_valid_bleu:<10.4f} {macro_valid_r1:<10.4f} {macro_valid_r2:<10.4f} {macro_valid_rl:<10.4f} {macro_valid_sbert:<10.4f}"
-    )
+    else:
+        print(f"{'Quintile':<10} {'Label':<12} {'Range':<15} {'Count':<8} {'Avg Words':<11} {'BLEU':<10} {'ROUGE-1':<10} {'ROUGE-2':<10} {'ROUGE-L':<10} {'SBERT Sim':<10}")
+        print("-" * 95)
+        for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
+            qdata = quintile_breakdown[qid]
+            print(
+                f"{qid:<10} {qdata['label']:<12} {qdata['range_words']:<15} {qdata['count']:<8} "
+                f"{qdata['avg_words']:<11.1f} {qdata['avg_bleu']:<10.4f} {qdata['avg_rouge1_f1']:<10.4f} "
+                f"{qdata['avg_rouge2_f1']:<10.4f} {qdata['avg_rougeL_f1']:<10.4f} {qdata['avg_sbert_similarity']:<10.4f}"
+            )
+        print("-" * 95)
+        print(
+            f"{'Overall (Valid >= ' + str(args.min_review_words) + 'w)':<39} {len(valid_items):<8} "
+            f"{'-':<11} {macro_valid_bleu:<10.4f} {macro_valid_r1:<10.4f} {macro_valid_r2:<10.4f} {macro_valid_rl:<10.4f} {macro_valid_sbert:<10.4f}"
+        )
     print(
         f"{'Filtered Ultra-Short (< ' + str(args.min_review_words) + 'w)':<39} {len(filtered_items):<8} "
         f"(Excluded from quintile evaluation)"
     )
-    print("=" * 95 + "\n")
+    print("=" * 105 + "\n")
 
 
 

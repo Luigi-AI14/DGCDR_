@@ -641,3 +641,108 @@ def evaluate_explanation_vs_review(
     metrics["sbert_similarity"] = round(sbert_sim, 4)
     return metrics
 
+
+def batch_compute_bert_score(
+    candidate_texts: List[str],
+    reference_texts: List[str],
+    model_type: str = "roberta-large",
+    batch_size: int = 16,
+    device: Optional[str] = None,
+    rescale_with_baseline: bool = True,
+) -> Dict[str, List[float]]:
+    """
+    Computes token-level semantic matching via BERTScore (Precision, Recall, F1)
+    using contextual representations (default: roberta-large).
+
+    Key Advantage over Sentence-BERT Cosine Similarity:
+    - BERTScore-Recall evaluates whether key experiential tokens/concepts from the user's
+      review are addressed by the candidate explanation, without diluting the score
+      due to the explanation's longer length and expository style.
+    - rescale_with_baseline=True rescales raw cosine similarities against empirical human
+      baselines for the model and language, overcoming the transformer representation
+      anisotropy (cone effect) and centering the metric on an intuitive [0, 1] range.
+
+    Args:
+        candidate_texts: List of LLM-generated explanations.
+        reference_texts: List of ground-truth reviews (optionally formatted with review title).
+        model_type: Hugging Face model identifier (default: 'roberta-large').
+        batch_size: Inference batch size for encoding tokens.
+        device: 'cuda' or 'cpu'. If None, auto-detected.
+        rescale_with_baseline: Whether to rescale scores against empirical baseline statistics (default: True).
+
+    Returns:
+        Dict with keys:
+            'precision': List[float]
+            'recall': List[float]
+            'f1': List[float]
+    """
+    if not candidate_texts or not reference_texts:
+        return {"precision": [], "recall": [], "f1": []}
+
+    if len(candidate_texts) != len(reference_texts):
+        raise ValueError(
+            f"Shape mismatch: {len(candidate_texts)} candidates vs {len(reference_texts)} references"
+        )
+
+    try:
+        from bert_score import score as bert_score_fn
+    except ImportError:
+        raise ImportError(
+            "bert-score is required for BERTScore evaluation. "
+            "Install it with 'pip install bert-score'."
+        )
+
+    import torch
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    valid_indices = []
+    clean_cands = []
+    clean_refs = []
+
+    for idx, (c, r) in enumerate(zip(candidate_texts, reference_texts)):
+        c_str = (c or "").strip()
+        r_str = (r or "").strip()
+        if c_str and r_str:
+            valid_indices.append(idx)
+            clean_cands.append(c_str)
+            clean_refs.append(r_str)
+
+    n_total = len(candidate_texts)
+    precisions = [0.0] * n_total
+    recalls = [0.0] * n_total
+    f1s = [0.0] * n_total
+
+    if clean_cands:
+        logger.info(
+            f"Computing BERTScore ({model_type}, rescaled={rescale_with_baseline}) for {len(clean_cands)} pairs on device: {device} (batch_size={batch_size})..."
+        )
+        try:
+            P, R, F1 = bert_score_fn(
+                cands=clean_cands,
+                refs=clean_refs,
+                model_type=model_type,
+                lang="en",
+                verbose=False,
+                batch_size=batch_size,
+                device=device,
+                rescale_with_baseline=rescale_with_baseline,
+            )
+            for i, orig_idx in enumerate(valid_indices):
+                precisions[orig_idx] = round(float(P[i]), 4)
+                recalls[orig_idx] = round(float(R[i]), 4)
+                f1s[orig_idx] = round(float(F1[i]), 4)
+        except Exception as e:
+            logger.error(f"Error computing BERTScore with model '{model_type}': {e}")
+            raise e
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return {
+        "precision": precisions,
+        "recall": recalls,
+        "f1": f1s,
+    }
+

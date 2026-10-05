@@ -1,6 +1,6 @@
 # DGCDR Cross-Domain LLM Explanation & Validation Framework
 
-This framework enables generating personalized cross-domain recommendation explanations with a local LLM (**Qwen 3.5 9B** or other LLMs via Ollama) for the **DGCDR** (*Disentangled Graph Cross Domain Recommender*) model, and validating those explanations against actual user reviews on held-out items using both syntactic metrics (**BLEU**, **ROUGE-1**, **ROUGE-2**, **ROUGE-L**) and semantic similarity metrics via **Sentence-BERT** (cosine similarity).
+This framework enables generating personalized cross-domain recommendation explanations with a local LLM (**Qwen 3.5 9B** or other LLMs via Ollama) for the **DGCDR** (*Disentangled Graph Cross Domain Recommender*) model, and validating those explanations against actual user reviews on held-out items using syntactic metrics (**BLEU**, **ROUGE-1**, **ROUGE-2**, **ROUGE-L**), global semantic similarity via **Sentence-BERT** (cosine similarity), and fine-grained token-level semantic coverage via **BERTScore** (**roberta-large**: Precision, Recall, F1).
 
 ---
 
@@ -148,6 +148,7 @@ This generates `cache/compact_<pair>.pkl` and `cache/compact_<pair>.json`, enabl
 | `--temperature` | `float` | `0.0` | LLM sampling temperature (0.0 for deterministic reproducibility) |
 | `--rating_threshold` | `float` | `4.0` | Minimum rating for interaction history and held-out items |
 | `--model` | `str` | `qwen3.5:9b` | Local Ollama model name |
+| `--prompt_version` | `str` | `v2` | Prompt template version (`v2` for pragmatic real-world utility, `v1` for baseline) |
 | `--ollama_url` | `str` | `http://localhost:11434` | Ollama API endpoint |
 | `--num_ctx` | `int` | `32768` | Ollama context window size |
 | `--sbert_model` | `str` | `all-MiniLM-L6-v2` | Sentence-BERT model name for semantic similarity |
@@ -157,6 +158,9 @@ This generates `cache/compact_<pair>.pkl` and `cache/compact_<pair>.json`, enabl
 | `--no_cache_llm` | `flag` | `False` | Disable on-disk caching of LLM explanations (force regeneration) |
 | `--min_review_words` | `int` | `5` | Minimum words threshold to filter ultra-short reviews in quintiles |
 | `--use_title_in_quintiles`| `flag`| `False` | Whether to include review title in quintile word count classification |
+| `--bertscore_model` | `str` | `roberta-large` | Hugging Face model identifier for BERTScore (standard benchmark) |
+| `--bertscore_batch_size` | `int` | `16` | Batch size for BERTScore token encoding (safe for GPU VRAM) |
+| `--no_bertscore` | `flag` | `False` | Disable computation of BERTScore metrics |
 | `--prompts_dir` | `str` | `saved_prompts` | Directory where user prompts are saved |
 | `--output_dir` | `str` | `results` | Directory where validation reports are saved |
 | `--dry_run` | `flag` | `False` | Run with mock LLM explanations without querying Ollama |
