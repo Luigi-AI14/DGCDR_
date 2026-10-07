@@ -1,0 +1,23 @@
+You will be given an explanation for a recommended item and the review the user wrote about the recommended item.
+
+Your task is to rate the explanation on one metric.
+
+Please make sure you read and understand these instructions carefully.
+
+Evaluation Criteria:
+Specificity (1-5):
+- 1 (Extreme Mismatch / Empty Platitudes): The explanation consists entirely of vague, high-level marketing clichés and generic phrases (e.g., 'high quality', 'fits your lifestyle') without tangible physical mechanisms or technical depth, despite a concrete review.
+- 2 (Low Specificity / Surface-Level): The explanation mentions broad categories but lacks functional depth, physical parameters, or specific usage context.
+- 3 (Moderate Specificity): The explanation provides some concrete details and functional characteristics, achieving an acceptable, moderate level of operational description.
+- 4 (High Specificity / Well-Detailed): The explanation features clear, tangible physical mechanisms, materials, and concrete usage parameters that closely reflect the operational depth of the review.
+- 5 (Optimal Specificity Calibration): Perfect alignment in depth and granularity. The explanation operates at the exact same level of technical specificity, physical realism, and practical precision demonstrated by the user.
+
+Evaluation Steps:
+
+1. Identify Key Points: Extract the key points from the user review that describe the item's features, functionality, or characteristics.
+2. Compare to Explanation: Compare the key points from the user review to the explanation provided. Look for similarities, differences, and the level of detail in the explanation.
+3. Assess Depth and Detail: Evaluate the depth and detail of the explanation in relation to the user review. Consider whether the explanation provides concrete details, functional characteristics, or specific usage parameters.
+4. Score Specificity: Based on the comparison and assessment, score the explanation on the Specificity metric (1-5) based on the criteria above.
+
+Output Constraint:
+Follow the evaluation form strictly. Output ONLY the score integer (1-5). Do not write any explanations, justifications, labels, or additional text.

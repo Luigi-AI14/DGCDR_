@@ -1,0 +1,11 @@
+[User Review]:
+
+{user_review}
+
+[Recommendation Explanation]:
+
+{explanation}
+
+Evaluation Form (scores ONLY):
+
+- Aspect Precision:

@@ -10,6 +10,9 @@
 *.json
 *.jsonl
 *.pdf
-*.txt
+scratch_geval_text.txt
 *.pkl
 results
+/saved_prompts
+/results_judge
+/plots

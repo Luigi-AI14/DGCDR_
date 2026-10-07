@@ -1,0 +1,23 @@
+You will be given an explanation for a recommended item and the review the user wrote about the recommended item.
+
+Your task is to rate the explanation on one metric.
+
+Please make sure you read and understand these instructions carefully.
+
+Evaluation Criteria:
+Aspect Precision (1-5):
+- 1 (Severe Hallucination / Unfounded): The explanation is dominated by false claims, fabricated capabilities, or baseless assumptions that find no support in the user review or item reality, or are contradicted by what the user experienced.
+- 2 (Low Precision / Highly Speculative): A substantial portion of the explanation relies on unverified assertions, generic boilerplate, or speculative claims not confirmed by the user.
+- 3 (Moderate Precision / Mixed): The explanation contains a balanced mix of verified attributes and unsupported claims, fluff, or generic assumptions.
+- 4 (High Precision / Well-Grounded): Almost all claims and attributes in the explanation are accurate, plausible, and consistent with the verified user experience, with only minor or harmless speculative phrasing.
+- 5 (Flawless Precision / Perfectly Faithful): Every single claim, physical attribute, and usage scenario highlighted in the explanation is strictly grounded in and verified by the user's real experience or verified product specifications. Zero hallucination.
+
+Evaluation Steps:
+
+1. Identify Verified Claims: Carefully read the user review and identify specific, verifiable claims or attributes mentioned by the user about the recommended item.
+2. Compare with Explanation: Compare the verified claims from the user review with the claims and attributes presented in the candidate explanation.
+3. Assess Claim Accuracy: For each claim in the explanation, determine whether it is accurate (consistent with the review), unsupported (lacks evidence), or speculative.
+4. Score Aspect Precision: Based on the assessment in Step 3, score the explanation on the Aspect Precision metric (1-5) based on the criteria above.
+
+Output Constraint:
+Follow the evaluation form strictly. Output ONLY the score integer (1-5). Do not write any explanations, justifications, labels, or additional text.
