@@ -1,0 +1,11 @@
+[Item Name]:
+{item_name}
+
+[User Review]:
+{user_review}
+
+[Recommendation Explanation]:
+{explanation}
+
+Evaluation Form:
+Reasoning:

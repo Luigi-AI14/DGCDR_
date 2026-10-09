@@ -1,0 +1,55 @@
+You will be given the item name, a user review about that item, and a recommendation explanation generated for that item.
+
+Your task is to rate the explanation on the metric Alignment based on a contrastive comparison between the review and the explanation.
+
+Please make sure you read and understand these instructions carefully.
+
+Evaluation Criteria:
+Alignment (1-5):
+- 1 (Hallucinated / Contradictory / Entity Mismatch):
+  The explanation hallucinates features, attributes, or usage scenarios that directly contradict, have zero plausible connection, or describe a completely different product category or functional device than what the user discussed in the review or indicated by the item name.
+  CRITICAL: If the item name and review describe a specific type of product (e.g., a car suction mount, an OTG cable, a protective case) and the explanation asserts claims about a completely different or incompatible device/domain (e.g., power outlets/charging stations, computer RAM/SSD, audio soundbars, clothing), this is an unambiguous SCORE 1 (Entity/Category Mismatch), NOT Score 3.
+
+- 2 (Both Review and Explanation Generic):
+  Both the user review and the recommendation explanation are vague, shallow, and generic. The review expresses only broad, uninformative sentiment without describing tangible product features, and the explanation makes only broad, generic assertions without grounding in concrete, verifiable attributes.
+
+- 3 (Generic Review vs. Detailed Explanation on Compatible Product):
+  The user review and the explanation refer to the same or plausibly compatible product type/context, but the review is superficial or lacks specific technical details (e.g., expresses only broad sentiment or brief mention of quality), whereas the explanation makes detailed technical claims that cannot be corroborated from the text.
+  CRITICAL: Score 3 applies ONLY when the explanation is plausibly compatible with the general product context discussed in the review and item name. Do NOT assign Score 3 if the explanation describes an entirely unrelated, incompatible, or divergent product category (that is Score 1).
+
+- 4 (Partial Alignment / At Least One Feature Claim Grounded):
+  At least one concrete feature, functional attribute, or practical claim asserted in the explanation is directly mentioned and corroborated in the user review. Other claims in the explanation may be unmentioned or unverified, but there is clear, confirmed overlap on at least one primary feature.
+
+- 5 (Strong Alignment / Majority of Feature Claims Grounded):
+  The majority or all of the specific feature claims, attributes, and usage benefits highlighted in the explanation are explicitly present, verified, and aligned with what the user evaluated in their review.
+
+Important Guidelines:
+- Category & Entity Divergence vs. Unverified Claims: Distinguish carefully between "unverified details about a compatible product" (Score 3) and "claims describing a completely different product" (Score 1). Using the item name and review context, if the explanation describes an unrelated device or product category (e.g., a PC, a power strip, a soundbar when the item is a mount or cable), the explanation is an outright hallucination/mismatch (Score 1).
+- Off-Topic / Non-Product Reviews: If the user review focuses exclusively on shipping, delivery, packaging, seller feedback, or promotional spam without discussing product features, assign Score 3, provided the explanation actually pertains to the item name. However, if the explanation describes an entirely different device or category from the item name, assign Score 1.
+
+Evaluation Steps:
+1. Read and Understand the Item, Review, and Explanation
+Carefully read the item name, the user review, and the recommendation explanation generated for the item.
+Use the item name to anchor the physical identity and category of the product, and take note of the specific features, attributes, and usage scenarios mentioned in both the review and the explanation.
+
+2. Identify Key Claims and Features in the Review
+Identify the key claims, features, and attributes mentioned in the user review.
+Determine the tone and sentiment of the review (e.g., positive, negative, neutral).
+Note any specific product features, technical specifications, or practical experiences mentioned in the review.
+
+3. Identify Key Claims and Features in the Explanation*
+Identify the key claims, features, and attributes mentioned in the recommendation explanation.
+Determine the tone and purpose of the explanation (e.g., highlighting benefits, addressing concerns).
+Note any specific product features, technical specifications, or practical benefits mentioned in the explanation.
+
+4. Compare the Review and Explanation for Alignment
+Compare the key claims, features, and attributes mentioned in the review and explanation following the principles mentioned in the evaluation criteria. First verify whether the explanation describes the same product entity/domain as indicated by the item name and review. If the explanation describes an unrelated device or category, evaluate as Score 1. If compatible, evaluate the degree to which claims are grounded in the user review.
+
+5. Evaluate the Explanation's Alignment
+Based on the comparison in Step 4, assign a score from 1 to 5 to evaluate the explanation's alignment with the user review.
+
+Output Format:
+Provide a concise contrastive reasoning (1-2 sentences) comparing the claims in the explanation against the user review, followed by the Alignment score.
+Follow this format strictly:
+Reasoning: <1-2 sentences of contrastive analysis>
+Alignment: <integer from 1 to 5>

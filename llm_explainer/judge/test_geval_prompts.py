@@ -3,22 +3,19 @@
 Test script for evaluating custom G-Eval System and Instance prompts with Ollama (llama3.1:8b).
 
 Features:
-- Multi-metric evaluation: supports 4 G-Eval metrics:
-    1. aspect_coverage
-    2. aspect_precision
-    3. sentiment_coherence
-    4. specificity
-- Default mode: runs all 4 metrics sequentially over all users in the results file.
-- CLI argument --metrics / --metric allows selecting one or more specific metrics.
+- Metric: 'Alignment' (Contrastive review vs explanation evaluation)
+- Two-stage CoT (Reasoning before vote):
+    1. LLM generates 1-2 sentences of contrastive reasoning (printed to terminal, not saved to file)
+    2. LLM outputs final Alignment score (1-5)
+- Extraction of score token log-probabilities via Ollama's OpenAI-compatible endpoint (/v1/chat/completions)
+  conditioned on the generated reasoning.
+- Exact G-Eval mathematical formulation (Liu et al., EMNLP 2023).
 - Excludes ultra-short reviews (< 5 words) to avoid synthetic evaluation skew.
 - Quintile review length stratification analysis (Q1-Q5: Micro, Short, Medium, Detailed, In-Depth).
 - Prompt template sanitization: removes [Product Information] to evaluate purely against user reviews.
-- Separate output files (.json and .md) per metric saved in 'results_judge/Cloth-Elec/'.
-- Outputs per-metric global mean score, weighted score, quintile stratification breakdown,
+- Separate output files (.json and .md) saved in 'results_judge/Cloth-Elec/'.
+- Outputs global mean score, weighted score, quintile stratification breakdown,
   per-user averages, and item-level details.
-- Output constraints (max_tokens=3, stop=['\n', '(']) to eliminate verbose explanations.
-- Extraction of score token log-probabilities via Ollama's OpenAI-compatible endpoint (/v1/chat/completions).
-- Exact G-Eval mathematical formulation (Liu et al., EMNLP 2023).
 """
 
 import argparse
@@ -32,6 +29,11 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+# Ensure repository root is on sys.path
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 try:
     from llm_explainer.quintiles import QuintileManager, count_words
 except ImportError:
@@ -44,31 +46,13 @@ except ImportError:
         return len(re.findall(r"\b\w+\b", text))
 
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROMPTS_DIR = os.path.join(REPO_ROOT, "llm_explainer", "prompts")
 
 METRICS_REGISTRY: Dict[str, Dict[str, str]] = {
-    "aspect_coverage": {
-        "id": "aspect_coverage",
-        "display_name": "Aspect Coverage",
-        "prompt_file": os.path.join(CURRENT_DIR, "TEST_PROMPT_ASPECT_COVERAGE.txt"),
-        "fallback_file": os.path.join(CURRENT_DIR, "TEST_PROMPT.txt"),
-    },
-    "aspect_precision": {
-        "id": "aspect_precision",
-        "display_name": "Aspect Precision",
-        "prompt_file": os.path.join(CURRENT_DIR, "TEST_PROMPT_ASPECT_PRECISION.txt"),
-        "fallback_file": None,
-    },
-    "sentiment_coherence": {
-        "id": "sentiment_coherence",
-        "display_name": "Sentiment Coherence",
-        "prompt_file": os.path.join(CURRENT_DIR, "TEST_PROMPT_SENTIMENT_COHERENCE.txt"),
-        "fallback_file": None,
-    },
-    "specificity": {
-        "id": "specificity",
-        "display_name": "Specificity",
-        "prompt_file": os.path.join(CURRENT_DIR, "TEST_PROMPT_SPECIFICITY.txt"),
+    "alignment": {
+        "id": "alignment",
+        "display_name": "Alignment",
+        "prompt_file": os.path.join(PROMPTS_DIR, "TEST_PROMPT_ALIGNMENT.txt"),
         "fallback_file": None,
     },
 }
@@ -83,9 +67,17 @@ DEFAULT_QUINTILE_SCHEMA: Dict[str, Dict[str, Any]] = {
 
 
 def load_text(file_path: str) -> str:
-    """Reads a text file."""
+    """Reads a text file with automatic path resolution."""
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File non trovato: {file_path}")
+        candidate = os.path.join(REPO_ROOT, file_path)
+        if os.path.exists(candidate):
+            file_path = candidate
+        else:
+            candidate_prompt = os.path.join(PROMPTS_DIR, os.path.basename(file_path))
+            if os.path.exists(candidate_prompt):
+                file_path = candidate_prompt
+            else:
+                raise FileNotFoundError(f"File non trovato: {file_path}")
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
@@ -190,19 +182,18 @@ def format_instance_prompt(
     """
     content = template
 
-    # Supporta sia {metric_name} esplicito, sia sostituzione di una metrica preesistente
     if "{metric_name}" in content:
         content = content.replace("{metric_name}", metric_name)
-    else:
-        content = re.sub(r"-\s*[^:\n]+:\s*$", f"- {metric_name}:", content.strip())
 
     format_kwargs = {
         "user_review": user_review,
         "explanation": explanation,
         "metric_name": metric_name,
+        "item_title": item_title or "",
+        "item_name": item_title or "",
+        "product_name": item_title or "",
+        "product_title": item_title or "",
     }
-    if "{item_title}" in content:
-        format_kwargs["item_title"] = item_title or ""
 
     return content.format(**format_kwargs)
 
@@ -276,7 +267,7 @@ def extract_users_from_results(
             else:
                 full_review = rev_text
 
-            user_items.append({
+            item_entry = {
                 "item_id": it.get("id_item", ""),
                 "item_title": item_title,
                 "user_review": full_review,
@@ -284,7 +275,18 @@ def extract_users_from_results(
                 "quintile": q_id,
                 "quintile_label": q_label,
                 "explanation": explanation,
-            })
+            }
+            if it.get("is_shuffled"):
+                item_entry["is_shuffled"] = True
+            if it.get("original_llm_explanation"):
+                item_entry["original_llm_explanation"] = it["original_llm_explanation"]
+            if it.get("shuffled_from_item_id"):
+                item_entry["shuffled_from_item_id"] = it["shuffled_from_item_id"]
+            if it.get("shuffled_from_item_title"):
+                item_entry["shuffled_from_item_title"] = it["shuffled_from_item_title"]
+            if it.get("shuffled_from_user_id"):
+                item_entry["shuffled_from_user_id"] = it["shuffled_from_user_id"]
+            user_items.append(item_entry)
             valid_items_count += 1
 
         if user_items:
@@ -300,6 +302,8 @@ def extract_users_from_results(
         "filtered_ultrashort_items": filtered_ultrashort_items,
         "min_words_filter": min_words,
         "quintile_schema": quintile_schema,
+        "is_shuffled": data.get("is_shuffled", False),
+        "shuffle_info": data.get("shuffle_info", {}),
     }
 
     return extracted, stats
@@ -314,18 +318,15 @@ def call_ollama_with_logprobs(
     ollama_url: str = "http://localhost:11434",
     timeout: int = 90,
     top_logprobs: int = 20,
-    max_tokens: int = 3,
+    max_tokens: int = 150,
     stop: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Calls Ollama via the OpenAI-compatible endpoint with logprobs=True.
-    Limits output tokens and uses stop sequences to guarantee ONLY the score is generated.
-    Extracts token probabilities for scores 1-5 and calculates the G-Eval weighted score.
+    Supports two-stage CoT (Reasoning followed by Alignment score).
+    Extracts token probabilities for scores 1-5 conditioned on the generated reasoning.
     """
     endpoint = f"{ollama_url.rstrip('/')}/v1/chat/completions"
-
-    if stop is None:
-        stop = ["\n", "("]
 
     payload = {
         "model": model,
@@ -338,8 +339,9 @@ def call_ollama_with_logprobs(
         "logprobs": True,
         "top_logprobs": top_logprobs,
         "max_tokens": max_tokens,
-        "stop": stop,
     }
+    if stop:
+        payload["stop"] = stop
 
     req = urllib.request.Request(
         endpoint,
@@ -355,6 +357,7 @@ def call_ollama_with_logprobs(
         return {
             "error": str(e),
             "response_text": f"[ERRORE CHIAMATA OLLAMA: {e}]",
+            "reasoning": "",
             "discrete_score": None,
             "weighted_score": None,
             "norm_probs": {},
@@ -366,32 +369,41 @@ def call_ollama_with_logprobs(
     logprobs_obj = choice.get("logprobs", {})
     content_tokens = logprobs_obj.get("content", []) if logprobs_obj else []
 
-    # Localizza il token dello score (il primo token che corrisponde a una cifra 1-5)
-    discrete_score = None
+    # Estrazione del reasoning e dello score discreto dal testo generato
+    score_match = re.search(r"(?:Alignment|Score):\s*([1-5])\b", message_content, re.IGNORECASE)
+    if score_match:
+        discrete_score = int(score_match.group(1))
+        reasoning_text = message_content[:score_match.start()].strip()
+        if reasoning_text.lower().startswith("reasoning:"):
+            reasoning_text = reasoning_text[len("reasoning:"):].strip()
+    else:
+        # Fallback: cerca l'ultima cifra 1-5 nel testo generato
+        all_digits = re.findall(r"\b([1-5])\b", message_content)
+        discrete_score = int(all_digits[-1]) if all_digits else None
+        reasoning_text = message_content.strip()
+
+    # Localizza il token corrispondente allo score nei logprob (cercando a ritroso dalla fine)
+    matched_tok = None
+    if discrete_score is not None:
+        target_str = str(discrete_score)
+        for tok_info in reversed(content_tokens):
+            tok_clean = tok_info.get("token", "").strip()
+            if tok_clean == target_str:
+                matched_tok = tok_info
+                break
+
     raw_probs = {i: 0.0 for i in range(1, 6)}
     score_token_found = False
 
-    for tok_info in content_tokens[:10]:
-        tok_clean = tok_info.get("token", "").strip()
-        if tok_clean in ["1", "2", "3", "4", "5"]:
-            discrete_score = int(tok_clean)
-            score_token_found = True
-
-            # Estrai logprobs dei candidati 1-5
-            for top_t in tok_info.get("top_logprobs", []):
-                cand_clean = top_t.get("token", "").strip()
-                if cand_clean in ["1", "2", "3", "4", "5"]:
-                    cand_val = int(cand_clean)
-                    lp = top_t.get("logprob")
-                    if lp is not None:
-                        raw_probs[cand_val] = math.exp(lp)
-            break
-
-    # Se non trovato nel primo token, fallback: regex sul testo completo
-    if discrete_score is None:
-        match = re.search(r"\b([1-5])\b", message_content)
-        if match:
-            discrete_score = int(match.group(1))
+    if matched_tok is not None:
+        score_token_found = True
+        for top_t in matched_tok.get("top_logprobs", []):
+            cand_clean = top_t.get("token", "").strip()
+            if cand_clean in ["1", "2", "3", "4", "5"]:
+                cand_val = int(cand_clean)
+                lp = top_t.get("logprob")
+                if lp is not None:
+                    raw_probs[cand_val] = math.exp(lp)
 
     # Calcolo G-Eval normalizzato: p(S = i) = P(i) / sum(P(j))
     total_p = sum(raw_probs.values())
@@ -405,6 +417,7 @@ def call_ollama_with_logprobs(
     return {
         "error": None,
         "response_text": message_content,
+        "reasoning": reasoning_text,
         "discrete_score": discrete_score,
         "weighted_score": round(weighted_score, 4) if weighted_score is not None else None,
         "norm_probs": {i: round(norm_probs[i], 4) for i in range(1, 6)},
@@ -416,8 +429,8 @@ def call_ollama_with_logprobs(
 def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users: List[Dict[str, Any]]) -> None:
     """
     Saves results to a JSON file.
-    Begins with global mean score, global mean weighted score, and quintile stratification.
-    Contains user-level structures with user averages and item lists.
+    Contains global mean score, global mean weighted score, and quintile stratification.
+    Detailed items do NOT include CoT reasoning (clean evaluation output).
     """
     payload = {
         "global_mean_score": summary["global_mean_score"],
@@ -447,8 +460,8 @@ def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users
 def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_users: List[Dict[str, Any]]) -> None:
     """
     Saves results to a Markdown (.md) file.
-    Begins with global mean score, global mean weighted score, and quintile stratification table.
-    Details each user with user mean score, user mean weighted score, and their evaluated items.
+    Contains global mean score, global mean weighted score, quintile stratification table,
+    and detailed items per user without CoT text.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 
@@ -469,8 +482,14 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         f"- **Model**: `{summary['model']}`",
         f"- **Timestamp**: `{summary['timestamp']}`",
         f"- **Source File**: `{summary['source_results']}`\n",
-        "---\n",
     ]
+
+    if summary.get("is_shuffled"):
+        lines.append(
+            "> ⚠️ **NEGATIVE BASELINE RUN (SHUFFLED PAIRS)**: This run evaluates randomized cross-item review-explanation pairs to establish the discriminative lower bound baseline for the LLM Judge.\n"
+        )
+
+    lines.append("---\n")
 
     # Tabella Stratificazione Quintili
     qm = summary.get("quintile_metrics", {})
@@ -548,16 +567,19 @@ def evaluate_single_metric(
 ) -> Tuple[str, str]:
     """
     Evaluates all users on a single metric, calculates averages and quintile breakdowns,
-    and saves separate .json and .md files.
+    and saves separate .json and .md files. Displays CoT reasoning on terminal without saving it to disk.
     Returns (json_path, md_path).
     """
     metric_info = METRICS_REGISTRY[metric_id]
     metric_display_name = metric_info["display_name"]
     system_prompt = load_metric_prompt(metric_info)
 
+    is_shuffled_data = stats.get("is_shuffled", False) or any(it.get("is_shuffled") for u in users_data for it in u.get("items", []))
+    shuffled_tag = "_shuffled" if is_shuffled_data else ""
+
     clean_model_name = args.model.replace(":", "_").replace("/", "_")
-    json_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}_{now_str}.json"
-    md_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}_{now_str}.md"
+    json_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.json"
+    md_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.md"
     json_output_path = os.path.join(args.output_dir, json_filename)
     md_output_path = os.path.join(args.output_dir, md_filename)
 
@@ -566,6 +588,7 @@ def evaluate_single_metric(
     print(f"  AVVIO VALUTAZIONE METRICA: {metric_display_name.upper()} ({metric_id})")
     print(f"  Utenti validi: {len(users_data)} | Item validi da valutare: {total_valid_items}")
     print(f"  Item ultra-short filtrati (< {stats['min_words_filter']}w): {stats['filtered_ultrashort_items']}")
+    print(f"  Modalita CoT: Reasoning mostrato su terminale (non salvato su file)")
     print(f"  Output JSON: {json_output_path}")
     print(f"  Output MD:   {md_output_path}")
     print(f"=================================================================\n")
@@ -596,7 +619,7 @@ def evaluate_single_metric(
                 seed=args.seed,
                 ollama_url=args.ollama_url,
                 max_tokens=args.max_tokens,
-                stop=["\n", "("],
+                stop=None,
             )
 
             if eval_result.get("error"):
@@ -605,18 +628,22 @@ def evaluate_single_metric(
 
             discrete = eval_result["discrete_score"]
             weighted = eval_result["weighted_score"]
+            reasoning = eval_result.get("reasoning", "")
 
             print(
                 f"    Item #{it_idx} ({it['item_id']} | {it['quintile']} {it['quintile_label']}) -> "
                 f"Score: {discrete}/5 | Weighted: {weighted}/5.0"
             )
+            if reasoning:
+                print(f"      [Reasoning]: {reasoning}")
 
             if discrete is not None:
                 global_scores.append(discrete)
             if weighted is not None:
                 global_weighted.append(weighted)
 
-            user_eval_items.append({
+            # Nota: reasoning NON salvato nel record su richiesta dell'utente
+            eval_item_entry = {
                 "item_id": it["item_id"],
                 "item_title": it["item_title"],
                 "review": it["user_review"],
@@ -626,7 +653,18 @@ def evaluate_single_metric(
                 "explanation": it["explanation"],
                 "score": discrete,
                 "weighted_score": weighted,
-            })
+            }
+            if it.get("is_shuffled"):
+                eval_item_entry["is_shuffled"] = True
+            if it.get("original_llm_explanation"):
+                eval_item_entry["original_llm_explanation"] = it["original_llm_explanation"]
+            if it.get("shuffled_from_item_id"):
+                eval_item_entry["shuffled_from_item_id"] = it["shuffled_from_item_id"]
+            if it.get("shuffled_from_item_title"):
+                eval_item_entry["shuffled_from_item_title"] = it["shuffled_from_item_title"]
+            if it.get("shuffled_from_user_id"):
+                eval_item_entry["shuffled_from_user_id"] = it["shuffled_from_user_id"]
+            user_eval_items.append(eval_item_entry)
 
         u_valid_scores = [x["score"] for x in user_eval_items if x["score"] is not None]
         u_valid_weighted = [x["weighted_score"] for x in user_eval_items if x["weighted_score"] is not None]
@@ -710,6 +748,8 @@ def evaluate_single_metric(
         "temperature": args.temperature,
         "timestamp": datetime.datetime.now().isoformat(),
         "source_results": args.results_file,
+        "is_shuffled": stats.get("is_shuffled", False),
+        "shuffle_info": stats.get("shuffle_info", {}),
     }
 
     save_results_json(json_output_path, summary, evaluated_users)
@@ -732,19 +772,19 @@ def evaluate_single_metric(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test manual G-Eval prompts with logprobs across 4 metrics on Ollama")
+    parser = argparse.ArgumentParser(description="Evaluate LLM explanations with G-Eval Alignment metric on Ollama")
     parser.add_argument("--model", type=str, default="llama3.1:8b", help="LLM judge model (default: llama3.1:8b)")
     parser.add_argument(
         "--metrics",
         "--metric",
         nargs="+",
-        default=None,
-        help="One or more metrics to evaluate: 'aspect_coverage', 'aspect_precision', 'sentiment_coherence', 'specificity', or 'all' (default: all 4 metrics executed sequentially)",
+        default=["alignment"],
+        help="Metric to evaluate (default: alignment)",
     )
     parser.add_argument(
         "--instance_prompt",
         type=str,
-        default="TEST_PROMPT_INSTANCE.txt",
+        default=os.path.join(PROMPTS_DIR, "TEST_PROMPT_INSTANCE.txt"),
         help="Path to instance prompt template",
     )
     parser.add_argument(
@@ -755,6 +795,7 @@ def main():
     )
     parser.add_argument(
         "--num_users",
+        "--max_users",
         type=int,
         default=None,
         help="Number of users to evaluate (default: None, processes all users in results file)",
@@ -768,7 +809,12 @@ def main():
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0)")
     parser.add_argument("--seed", type=int, default=42, help="Seed (default: 42)")
-    parser.add_argument("--max_tokens", type=int, default=3, help="Max tokens to generate (default: 3)")
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=150,
+        help="Max tokens to generate for CoT reasoning + score (default: 150)",
+    )
     parser.add_argument("--ollama_url", type=str, default="http://localhost:11434", help="Ollama URL")
     parser.add_argument(
         "--output_dir",
@@ -777,6 +823,15 @@ def main():
         help="Directory to save JSON and MD output files (default: results_judge/Cloth-Elec)",
     )
     args = parser.parse_args()
+
+    # Normalizzazione percorsi file rispetto a REPO_ROOT se necessario
+    if not os.path.exists(args.results_file):
+        candidate_res = os.path.join(REPO_ROOT, args.results_file)
+        if os.path.exists(candidate_res):
+            args.results_file = candidate_res
+
+    if not os.path.isabs(args.output_dir):
+        args.output_dir = os.path.join(REPO_ROOT, args.output_dir)
 
     # Risoluzione metriche selezionate
     all_metric_keys = list(METRICS_REGISTRY.keys())
@@ -808,7 +863,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=================================================================")
-    print("      G-EVAL SEQUENTIAL PIPELINE: MULTI-METRIC RUNNER            ")
+    print("           G-EVAL PIPELINE: ALIGNMENT (TWO-STAGE CoT)            ")
     print("=================================================================")
     print(f"Model:                {args.model}")
     print(f"Selected Metrics:     {selected_metrics} ({len(selected_metrics)} in totale)")
@@ -818,6 +873,7 @@ def main():
         f"Total Items:          {stats['total_source_items']} "
         f"(validi: {stats['valid_items_count']}, filtrati ultra-short < {args.min_words}w: {stats['filtered_ultrashort_items']})"
     )
+    print(f"Max Tokens per Item:  {args.max_tokens} (CoT reasoning + score)")
     print(f"Output Directory:     {args.output_dir}")
     print("=================================================================\n")
 
