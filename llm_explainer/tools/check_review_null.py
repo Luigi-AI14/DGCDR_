@@ -3,6 +3,10 @@ import sys
 import time
 import json
 from concurrent.futures import ProcessPoolExecutor
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 def check_file(file_path):
     filename = os.path.basename(file_path)
     print(f"[{filename}] Inizio analisi...", flush=True)
@@ -72,7 +76,7 @@ def check_file(file_path):
     }
 
 def main():
-    folder = os.path.join(os.getcwd(), "review_metadata")
+    folder = os.path.join(REPO_ROOT, "review_metadata")
     files = [
         os.path.join(folder, "Cloth.jsonl"),
         os.path.join(folder, "Elec.jsonl")

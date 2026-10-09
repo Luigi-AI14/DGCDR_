@@ -13,13 +13,17 @@ import argparse
 import sys
 import os
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 from llm_explainer.config import DOMAIN_CONFIGS
 from llm_explainer.quintiles import QuintileManager
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compute and export statistical 5-Quintile partitions (Scenario A) for DGCDR datasets."
+        description="Compute and export statistical 5-Quintile partitions for DGCDR datasets."
     )
     parser.add_argument(
         "--domain_pair",

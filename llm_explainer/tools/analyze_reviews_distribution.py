@@ -12,9 +12,14 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 import numpy as np
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 def count_words(text: str) -> int:
@@ -135,7 +140,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    json_path = os.path.join(args.cache_dir, f"compact_{args.domain_pair}.json")
+    cache_dir = args.cache_dir
+    if not os.path.isabs(cache_dir):
+        cache_dir = os.path.join(REPO_ROOT, cache_dir)
+    json_path = os.path.join(cache_dir, f"compact_{args.domain_pair}.json")
 
     if not os.path.exists(json_path):
         print(f"Error: Compact file not found at {json_path}")
