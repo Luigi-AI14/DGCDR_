@@ -37,7 +37,7 @@ Identify the key claims, features, and attributes mentioned in the user review.
 Determine the tone and sentiment of the review (e.g., positive, negative, neutral).
 Note any specific product features, technical specifications, or practical experiences mentioned in the review.
 
-3. Identify Key Claims and Features in the Explanation*
+3. Identify Key Claims and Features in the Explanation
 Identify the key claims, features, and attributes mentioned in the recommendation explanation.
 Determine the tone and purpose of the explanation (e.g., highlighting benefits, addressing concerns).
 Note any specific product features, technical specifications, or practical benefits mentioned in the explanation.
