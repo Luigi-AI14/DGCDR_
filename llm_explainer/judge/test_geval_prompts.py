@@ -316,7 +316,7 @@ def call_ollama_with_logprobs(
     temperature: float = 0.0,
     seed: int = 42,
     ollama_url: str = "http://localhost:11434",
-    timeout: int = 90,
+    timeout: int = 180,
     top_logprobs: int = 20,
     max_tokens: int = 150,
     stop: Optional[List[str]] = None,

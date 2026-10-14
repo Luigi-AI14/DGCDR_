@@ -126,6 +126,8 @@ def find_latest_eval_files(
 
     for f in all_files:
         bname = os.path.basename(f)
+        if bname.startswith("benchmark_"):
+            continue
         if "_shuffled_" in bname or "_shuffled" in bname:
             shuffled_files.append(f)
         else:
@@ -762,7 +764,7 @@ def compare_congruent_vs_shuffled(
         f"- **Shuffled Source**: `{os.path.basename(shuffled_path)}`",
         f"- **Timestamp**: `{datetime.datetime.now().isoformat()}`\n",
         "### 1. Key Discriminative Metrics",
-        f"| Metric | Congruent (Real) | Shuffled (Baseline) | Contrastive Margin ($\Delta$) | Win Rate (Pos > Neg) |",
+        rf"| Metric | Congruent (Real) | Shuffled (Baseline) | Contrastive Margin ($\Delta$) | Win Rate (Pos > Neg) |",
         f"|:---|:---:|:---:|:---:|:---:|",
         f"| **Discrete Score (1-5)** | **{stats_c_disc['mean']}** &plusmn; {stats_c_disc['std']} | **{stats_s_disc['mean']}** &plusmn; {stats_s_disc['std']} | **{margin_disc:+.4f}** | **{win_rate}%** |",
         f"| **Weighted Score (G-Eval)** | **{stats_c_wt['mean']}** &plusmn; {stats_c_wt['std']} | **{stats_s_wt['mean']}** &plusmn; {stats_s_wt['std']} | **{margin_wt:+.4f}** | - |\n",
@@ -788,7 +790,7 @@ def compare_congruent_vs_shuffled(
         f"- **Wilcoxon Signed-Rank Test**: W = {tests_disc.get('wilcoxon_stat')}, p-value = {fmt_p(tests_disc.get('wilcoxon_pvalue'))}",
         f"- **Cohen's d (Effect Size)**: d = {tests_disc.get('cohens_d')} ({'Large effect' if (tests_disc.get('cohens_d') or 0) > 0.8 else 'Moderate effect'})\n",
         "### 5. Stratification by Review Length Quintiles",
-        "| Quintile | Label | Count | Congruent Mean | Shuffled Mean | Margin ($\Delta$) | Win Rate |",
+        r"| Quintile | Label | Count | Congruent Mean | Shuffled Mean | Margin ($\Delta$) | Win Rate |",
         "|:---|:---|:---:|:---:|:---:|:---:|:---:|",
     ])
 
