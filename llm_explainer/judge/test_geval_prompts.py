@@ -322,11 +322,19 @@ def call_ollama_with_logprobs(
     stop: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Calls Ollama via the OpenAI-compatible endpoint with logprobs=True.
+    Calls Ollama via the /api/chat endpoint with think=False and logprobs=True.
     Supports two-stage CoT (Reasoning followed by Alignment score).
     Extracts token probabilities for scores 1-5 conditioned on the generated reasoning.
     """
-    endpoint = f"{ollama_url.rstrip('/')}/v1/chat/completions"
+    endpoint = f"{ollama_url.rstrip('/')}/api/chat"
+
+    options_dict: Dict[str, Any] = {
+        "temperature": temperature,
+        "seed": seed,
+        "num_predict": max_tokens,
+    }
+    if stop:
+        options_dict["stop"] = stop
 
     payload = {
         "model": model,
@@ -334,14 +342,12 @@ def call_ollama_with_logprobs(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": instance_prompt},
         ],
-        "temperature": temperature,
-        "seed": seed,
+        "stream": False,
+        "think": False,
         "logprobs": True,
         "top_logprobs": top_logprobs,
-        "max_tokens": max_tokens,
+        "options": options_dict,
     }
-    if stop:
-        payload["stop"] = stop
 
     req = urllib.request.Request(
         endpoint,
@@ -364,10 +370,22 @@ def call_ollama_with_logprobs(
             "raw_probs": {},
         }
 
-    choice = res_data.get("choices", [{}])[0]
-    message_content = choice.get("message", {}).get("content", "").strip()
-    logprobs_obj = choice.get("logprobs", {})
-    content_tokens = logprobs_obj.get("content", []) if logprobs_obj else []
+    # Support both native /api/chat and OpenAI /v1/chat/completions response structures
+    if "message" in res_data:
+        msg = res_data.get("message", {})
+        message_content = msg.get("content", "").strip()
+        content_tokens = res_data.get("logprobs", []) or []
+    elif "choices" in res_data:
+        choice = res_data.get("choices", [{}])[0]
+        msg = choice.get("message", {})
+        message_content = msg.get("content", "").strip()
+        if not message_content and msg.get("reasoning"):
+            message_content = msg.get("reasoning", "").strip()
+        logprobs_obj = choice.get("logprobs", {})
+        content_tokens = logprobs_obj.get("content", []) if logprobs_obj else []
+    else:
+        message_content = ""
+        content_tokens = []
 
     # Estrazione del reasoning e dello score discreto dal testo generato
     score_match = re.search(r"(?:Alignment|Score):\s*([1-5])\b", message_content, re.IGNORECASE)
