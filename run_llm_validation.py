@@ -134,7 +134,14 @@ def parse_args():
     parser.add_argument(
         "--use_title_in_quintiles",
         action="store_true",
-        help="Whether to include review title in quintile word count classification.",
+        default=DEFAULT_SETTINGS.get("use_title_in_quintiles", True),
+        help="Whether to include review title in quintile word count classification (default: True).",
+    )
+    parser.add_argument(
+        "--no_title_in_quintiles",
+        action="store_false",
+        dest="use_title_in_quintiles",
+        help="Exclude review title from quintile word count classification.",
     )
     parser.add_argument(
         "--num_ctx",
@@ -230,6 +237,8 @@ def main():
     print(f"Seed:                {args.seed}")
     print(f"Temperature:         {args.temperature}")
     print(f"Rating Threshold:    >= {args.rating_threshold}")
+    print(f"Held-out Min Words:  >= {args.min_review_words} words (including title)")
+    print(f"Sampling Strategy:   Uniform random distribution (seed={args.seed})")
     print(f"Prompt Version:      {args.prompt_version}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
@@ -301,6 +310,7 @@ def main():
         domain_pair=args.domain_pair,
         seed=args.seed,
         min_rating=args.rating_threshold,
+        min_held_out_words=args.min_review_words,
     )
 
     users_data = extractor.get_users_for_validation(num_users=args.num_users)

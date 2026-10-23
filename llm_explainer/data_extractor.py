@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,6 +20,7 @@ from recbole_cdr.config import CDRConfig
 from recbole_cdr.data import create_dataset
 
 from llm_explainer.config import BASE_DIR, DOMAIN_CONFIGS
+from llm_explainer.quintiles import count_words
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class DataExtractor:
         domain_pair: str = "Cloth-Elec",
         seed: int = 42,
         min_rating: float = 4.0,
+        min_held_out_words: int = 5,
         cache_dir: Optional[str] = None,
     ):
         if domain_pair not in DOMAIN_CONFIGS:
@@ -55,6 +58,7 @@ class DataExtractor:
         self.config_info = DOMAIN_CONFIGS[domain_pair]
         self.seed = seed
         self.min_rating = min_rating
+        self.min_held_out_words = min_held_out_words
         self.cache_dir = cache_dir or os.path.join(BASE_DIR, "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -310,10 +314,11 @@ class DataExtractor:
 
     def get_users_for_validation(self, num_users: int = 5) -> List[Dict]:
         """
-        Extracts complete, verified profiles for num_users.
+        Extracts complete, verified profiles for num_users via uniform random sampling.
         Guarantees:
-        - History items have rating >= 4.0 and valid text.
-        - Held-out items have rating >= 4.0 and valid ground-truth text.
+        - History items have rating >= min_rating (default 4.0) and valid text.
+        - Held-out items have rating >= min_rating and valid text with combined word count >= min_held_out_words (default 5, including review title).
+        - Users are sampled from a uniform distribution across all eligible users.
         """
         user_source_all, user_target_history, user_target_test = self.load_recbole_splits()
 
@@ -340,8 +345,10 @@ class DataExtractor:
                 "Falling back to on-the-fly streaming scan. "
                 "(TIP: Run 'python preprocess_compact_data.py' once for instant sub-second loading!)"
             )
-            # Take candidate pool (e.g. first num_users * 4 to account for review text filtering)
-            pool_uids = set(overlapping_uids[: max(num_users * 4, 20)])
+            # Take a uniform candidate pool across overlapping users to avoid bias towards initial alphabetical users
+            rng_pool = random.Random(self.seed)
+            pool_size = min(len(overlapping_uids), max(num_users * 5, 50))
+            pool_uids = set(rng_pool.sample(overlapping_uids, k=pool_size))
 
             all_src_items = set()
             all_tgt_items = set()
@@ -356,13 +363,13 @@ class DataExtractor:
                 target_item_ids=all_tgt_items,
             )
 
-        valid_users = []
+        all_valid_users = []
 
         for uid in overlapping_uids:
             if pool_uids is not None and uid not in pool_uids:
                 continue
 
-            # 1. Source History: items with rating >= 4 and valid review
+            # 1. Source History: items with rating >= min_rating and valid review
             src_hist = []
             for iid in user_source_all.get(uid, []):
                 rev = src_reviews.get((uid, iid))
@@ -377,7 +384,7 @@ class DataExtractor:
                         }
                     )
 
-            # 2. Target History: items with rating >= 4 and valid review
+            # 2. Target History: items with rating >= min_rating and valid review
             tgt_hist = []
             for iid in user_target_history.get(uid, []):
                 rev = tgt_reviews.get((uid, iid))
@@ -392,24 +399,26 @@ class DataExtractor:
                         }
                     )
 
-            # 3. Held-out Target Items: items with rating >= 4 and valid review
+            # 3. Held-out Target Items: items with rating >= min_rating, valid review, and length >= min_held_out_words (including title)
             held_out = []
             for iid in user_target_test.get(uid, []):
                 rev = tgt_reviews.get((uid, iid))
                 if rev and rev["rating"] >= self.min_rating and is_valid_review_text(rev["text"]):
-                    held_out.append(
-                        {
-                            "item_id": iid,
-                            "item_title": tgt_titles.get(iid, f"Item {iid}"),
-                            "ground_truth_rating": rev["rating"],
-                            "ground_truth_review": rev["text"],
-                            "ground_truth_title": rev.get("title", ""),
-                        }
-                    )
+                    full_rev_text = f"{rev.get('title') or ''} {rev['text']}".strip()
+                    if count_words(full_rev_text) >= self.min_held_out_words:
+                        held_out.append(
+                            {
+                                "item_id": iid,
+                                "item_title": tgt_titles.get(iid, f"Item {iid}"),
+                                "ground_truth_rating": rev["rating"],
+                                "ground_truth_review": rev["text"],
+                                "ground_truth_title": rev.get("title", ""),
+                            }
+                        )
 
-            # Check eligibility: must have at least 1 in each
+            # Check eligibility: must have at least 1 valid item in each of the three sets
             if src_hist and tgt_hist and held_out:
-                valid_users.append(
+                all_valid_users.append(
                     {
                         "user_id": uid,
                         "source_domain": self.source_display,
@@ -420,8 +429,32 @@ class DataExtractor:
                     }
                 )
 
-            if len(valid_users) >= num_users:
-                break
+        total_eligible = len(all_valid_users)
+        logger.info(
+            f"Found {total_eligible} total eligible users matching all criteria "
+            f"(history valid, held-out words >= {self.min_held_out_words})."
+        )
 
-        logger.info(f"Successfully selected {len(valid_users)} eligible users for validation.")
-        return valid_users
+        if total_eligible == 0:
+            logger.warning("No eligible users found matching all constraints!")
+            return []
+
+        # Uniform random sampling without replacement
+        if total_eligible <= num_users:
+            logger.warning(
+                f"Requested {num_users} users, but only {total_eligible} eligible users available. "
+                "Returning all eligible users."
+            )
+            selected_users = all_valid_users
+        else:
+            rng = random.Random(self.seed)
+            selected_users = rng.sample(all_valid_users, k=num_users)
+
+        # Sort selected users by user_id for deterministic and organized logging / output files
+        selected_users.sort(key=lambda u: u["user_id"])
+
+        logger.info(
+            f"Successfully sampled {len(selected_users)} users from uniform distribution "
+            f"(out of {total_eligible} eligible, seed={self.seed})."
+        )
+        return selected_users

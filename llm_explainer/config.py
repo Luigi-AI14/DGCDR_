@@ -104,6 +104,7 @@ DEFAULT_SETTINGS = {
     "model_name": "qwen3.5:9b",
     "sbert_model": "all-MiniLM-L6-v2",
     "min_review_words": 5,
+    "use_title_in_quintiles": True,
     "num_ctx": 32768,
     "ollama_url": "http://localhost:11434",
     "prompts_dir": os.path.join(BASE_DIR, "saved_prompts"),
