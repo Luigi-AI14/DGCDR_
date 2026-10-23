@@ -1,7 +1,7 @@
 """
-Ollama client for local LLM inference with Qwen 3.5 9B.
+Ollama client for local LLM inference with Qwen 3.5 9B / Llama 3.1 8B.
 Uses standard urllib for zero-dependency HTTP communication.
-Enforces JSON format mode and validates parsed structure.
+Enforces JSON format mode, handles single-item and batched explanations, and includes retry logic.
 """
 
 import json
@@ -43,26 +43,8 @@ class OllamaClient:
             logger.warning(f"Ollama health check failed: {e}")
             return False
 
-    def generate_explanations(self, prompt: str, mock: bool = False, expected_items: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
-        """
-        Send prompt to Ollama and return parsed explanations list.
-        Each item in the returned list is:
-            {"item_id": str, "item_title": str, "explanation": str}
-        """
-        if mock:
-            # Generate deterministic mock explanations for dry-run testing
-            results = []
-            if expected_items:
-                for it in expected_items:
-                    results.append(
-                        {
-                            "item_id": it["item_id"],
-                            "item_title": it.get("item_title", ""),
-                            "explanation": f"The DGCDR model recommended '{it.get('item_title', it['item_id'])}' based on the user's strong affinity for durable, comfortable and highly rated products demonstrated across their multi-domain history.",
-                        }
-                    )
-            return results
-
+    def _call_ollama_api(self, prompt: str) -> str:
+        """Internal helper to send a prompt to Ollama /api/chat and return raw text."""
         url = f"{self.base_url}/api/chat"
         system_instruction = (
             "You are an expert Recommender System AI assistant specializing in personalized explanation generation. "
@@ -104,15 +86,91 @@ class OllamaClient:
                 raw_response = message.get("content", "")
                 if not raw_response and "response" in resp_data:
                     raw_response = resp_data.get("response", "")
+                return raw_response
         except urllib.error.URLError as e:
             raise ConnectionError(f"Failed to communicate with Ollama at {url}: {e}")
 
-        # Parse JSON from model response
+    def generate_explanation(
+        self,
+        prompt: str,
+        mock: bool = False,
+        expected_item: Optional[Dict[str, str]] = None,
+        max_retries: int = 1,
+    ) -> Dict[str, str]:
+        """
+        Send single-item prompt to Ollama and return parsed explanation dict:
+            {"item_id": str, "item_title": str, "explanation": str}
+        Includes retry mechanism (up to max_retries retries).
+        """
+        item_id = str(expected_item.get("item_id", "")).strip() if expected_item else ""
+        item_title = str(expected_item.get("item_title", item_id)).strip() if expected_item else item_id
+
+        if mock:
+            return {
+                "item_id": item_id,
+                "item_title": item_title,
+                "explanation": (
+                    f"The DGCDR model recommended '{item_title}' based on user preference "
+                    "for reliable durability and high performance demonstrated across past interactions."
+                ),
+            }
+
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                raw_response = self._call_ollama_api(prompt)
+                explanations = self._parse_json_response(raw_response, expected_item=expected_item)
+                if explanations:
+                    return explanations[0]
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Attempt {attempt + 1} for item '{item_id}' failed ({e}). Retrying..."
+                    )
+                else:
+                    logger.error(f"All {max_retries + 1} attempts failed for item '{item_id}': {e}")
+
+        # Fallback if all attempts fail
+        return {
+            "item_id": item_id,
+            "item_title": item_title,
+            "explanation": "",
+        }
+
+    def generate_explanations(
+        self,
+        prompt: str,
+        mock: bool = False,
+        expected_items: Optional[List[Dict[str, str]]] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Send prompt to Ollama and return parsed explanations list.
+        Each item in the returned list is:
+            {"item_id": str, "item_title": str, "explanation": str}
+        """
+        if mock:
+            # Generate deterministic mock explanations for dry-run testing
+            results = []
+            if expected_items:
+                for it in expected_items:
+                    results.append(
+                        {
+                            "item_id": it["item_id"],
+                            "item_title": it.get("item_title", ""),
+                            "explanation": f"The DGCDR model recommended '{it.get('item_title', it['item_id'])}' based on the user's strong affinity for durable, comfortable and highly rated products demonstrated across their multi-domain history.",
+                        }
+                    )
+            return results
+
+        raw_response = self._call_ollama_api(prompt)
         explanations = self._parse_json_response(raw_response)
         return explanations
 
-    def _parse_json_response(self, raw_text: str) -> List[Dict[str, str]]:
-        """Extract and validate the explanations list from model JSON output."""
+    def _parse_json_response(
+        self, raw_text: str, expected_item: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, str]]:
+        """Extract and validate explanations from model JSON output (single dict or list)."""
         parsed = None
         cleaned = raw_text.strip()
 
@@ -148,15 +206,20 @@ class OllamaClient:
             items = parsed["explanations"]
         elif isinstance(parsed, list):
             items = parsed
+        elif isinstance(parsed, dict) and ("item_id" in parsed or "explanation" in parsed):
+            items = [parsed]
         else:
             items = []
+
+        exp_iid = str(expected_item.get("item_id", "")).strip() if expected_item else ""
+        exp_title = str(expected_item.get("item_title", "")).strip() if expected_item else ""
 
         validated = []
         for entry in items:
             if not isinstance(entry, dict):
                 continue
-            item_id = str(entry.get("item_id", "")).strip()
-            item_title = str(entry.get("item_title", "")).strip()
+            item_id = str(entry.get("item_id", "")).strip() or exp_iid
+            item_title = str(entry.get("item_title", "")).strip() or exp_title
             explanation = str(entry.get("explanation", "")).strip()
 
             if item_id and explanation:
@@ -171,7 +234,18 @@ class OllamaClient:
         if validated:
             return validated
 
-        # 4. Fallback: regex search for individual JSON objects
+        # 4. Fallback: regex search for single explanation
+        expl_match = re.search(r'"explanation"\s*:\s*"([^"]+)"', cleaned)
+        if expl_match and exp_iid:
+            return [
+                {
+                    "item_id": exp_iid,
+                    "item_title": exp_title,
+                    "explanation": expl_match.group(1).strip(),
+                }
+            ]
+
+        # 5. Fallback: regex search for individual JSON objects
         item_matches = re.finditer(
             r'\{\s*"item_id"\s*:\s*"([^"]+)"\s*,\s*"item_title"\s*:\s*"([^"]*)"\s*,\s*"explanation"\s*:\s*"([^"]+)"',
             cleaned,

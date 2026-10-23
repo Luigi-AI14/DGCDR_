@@ -36,7 +36,7 @@ from llm_explainer.metrics import (
     validate_and_resolve_sbert_model,
 )
 from llm_explainer.ollama_client import OllamaClient
-from llm_explainer.prompt_builder import build_user_prompt
+from llm_explainer.prompt_builder import build_item_prompt, build_user_prompt
 from llm_explainer.quintiles import QuintileManager
 
 logging.basicConfig(
@@ -99,7 +99,7 @@ def parse_args():
         "-pv",
         type=str,
         default=DEFAULT_SETTINGS.get("prompt_version", "v2"),
-        help="Prompt version identifier (default: v2 for pragmatic real-world prompt, v1 for baseline).",
+        help="Prompt version identifier (default: v2).",
     )
     parser.add_argument(
         "--ollama_url",
@@ -122,8 +122,8 @@ def parse_args():
     parser.add_argument(
         "--sbert_model",
         type=str,
-        default=DEFAULT_SETTINGS.get("sbert_model", "all-MiniLM-L6-v2"),
-        help="Sentence-BERT model name for semantic similarity (default: all-MiniLM-L6-v2).",
+        default=DEFAULT_SETTINGS.get("sbert_model", "BAAI/bge-large-en-v1.5"),
+        help="Sentence-BERT model name for semantic similarity (default: BAAI/bge-large-en-v1.5).",
     )
     parser.add_argument(
         "--min_review_words",
@@ -360,25 +360,9 @@ def main():
         )
         logger.info(f"  Held-out items to explain: {len(user['held_out_items'])}")
 
-        # Build prompt & save to dedicated run directory
-        recommended_for_prompt = [
-            {"item_id": it["item_id"], "item_title": it["item_title"]}
-            for it in user["held_out_items"]
-        ]
+        total_user_items = len(user["held_out_items"])
 
-        prompt_text, prompt_file = build_user_prompt(
-            user_id=uid,
-            source_domain_name=user["source_domain"],
-            target_domain_name=user["target_domain"],
-            source_history=user["source_history"],
-            target_history=user["target_history"],
-            recommended_items=recommended_for_prompt,
-            prompts_dir=run_prompts_dir,
-            prompt_version=args.prompt_version,
-        )
-        logger.info(f"  Prompt generated and saved to: {prompt_file}")
-
-        # Obtain explanations: check cache first, otherwise invoke LLM
+        # Obtain explanations: check cache first (user-level 'all or nothing'), otherwise invoke LLM item-by-item
         expected_ids = [it["item_id"] for it in user["held_out_items"]]
         cached_expls = (
             expl_cache.get_user_explanations(uid, expected_ids)
@@ -386,27 +370,74 @@ def main():
             else None
         )
 
+        expl_map = {}
+        prompt_files_map = {}
+
         if cached_expls is not None:
             logger.info(
                 f"  [LLM Cache Hit] Reusing {len(cached_expls)} pre-computed explanations for user {uid}."
             )
             expl_map = cached_expls
-        else:
-            logger.info(f"  Generating explanations with {args.model}...")
-            try:
-                llm_explanations = ollama_client.generate_explanations(
-                    prompt=prompt_text,
-                    mock=args.dry_run,
-                    expected_items=recommended_for_prompt,
+            # Ensure prompt files exist for cached items
+            for held_it in user["held_out_items"]:
+                iid = held_it["item_id"]
+                target_item_dict = {"item_id": iid, "item_title": held_it["item_title"]}
+                _, p_file = build_item_prompt(
+                    user_id=uid,
+                    source_domain_name=user["source_domain"],
+                    target_domain_name=user["target_domain"],
+                    source_history=user["source_history"],
+                    target_history=user["target_history"],
+                    target_item=target_item_dict,
+                    prompts_dir=run_prompts_dir,
+                    prompt_version=args.prompt_version,
                 )
-            except Exception as e:
-                logger.error(f"  Error calling LLM for user {uid}: {e}")
-                llm_explanations = []
+                prompt_files_map[iid] = p_file
+        else:
+            logger.info(f"  Generating explanations with {args.model} item-by-item...")
+            generated_list = []
+            for it_idx, held_it in enumerate(user["held_out_items"], 1):
+                iid = held_it["item_id"]
+                title = held_it["item_title"]
+                target_item_dict = {"item_id": iid, "item_title": title}
 
-            # Index explanations by item_id
-            expl_map = {entry["item_id"]: entry.get("explanation", "") for entry in llm_explanations}
+                prompt_text, p_file = build_item_prompt(
+                    user_id=uid,
+                    source_domain_name=user["source_domain"],
+                    target_domain_name=user["target_domain"],
+                    source_history=user["source_history"],
+                    target_history=user["target_history"],
+                    target_item=target_item_dict,
+                    prompts_dir=run_prompts_dir,
+                    prompt_version=args.prompt_version,
+                )
+                prompt_files_map[iid] = p_file
+
+                try:
+                    res_dict = ollama_client.generate_explanation(
+                        prompt=prompt_text,
+                        mock=args.dry_run,
+                        expected_item=target_item_dict,
+                        max_retries=1,
+                    )
+                    item_explanation = res_dict.get("explanation", "").strip()
+                except Exception as e:
+                    logger.error(f"  Item #{it_idx} ({iid}) error calling LLM: {e}")
+                    item_explanation = ""
+
+                expl_map[iid] = item_explanation
+                generated_list.append({
+                    "item_id": iid,
+                    "item_title": title,
+                    "explanation": item_explanation,
+                })
+                logger.info(
+                    f"    Item #{it_idx}/{total_user_items} ({iid}) -> "
+                    f"Generated ({len(item_explanation)} chars)"
+                )
+
             if not args.dry_run and not args.no_cache_llm:
-                expl_cache.set_user_explanations(uid, llm_explanations)
+                expl_cache.set_user_explanations(uid, generated_list)
 
         # Calculate metrics for each held-out item
         user_items_evaluated = []
@@ -421,6 +452,7 @@ def main():
             ground_truth_text = held_it["ground_truth_review"]
             ground_truth_title = held_it.get("ground_truth_title", "")
             explanation = expl_map.get(iid, "")
+            item_prompt_file = prompt_files_map.get(iid, "")
 
             if not explanation:
                 logger.warning(f"  No explanation returned by LLM for item {iid}!")
@@ -466,6 +498,7 @@ def main():
                 "is_filtered_ultrashort": is_filtered_ultrashort,
                 "llm_explanation": explanation,
                 "metrics": metrics,
+                "prompt_file": item_prompt_file,
             }
             user_items_evaluated.append(item_record)
             all_evaluated_items.append(item_record)
@@ -482,9 +515,11 @@ def main():
         avg_r2 = round(sum(user_r2) / len(user_r2), 4) if user_r2 else 0.0
         avg_rl = round(sum(user_rl) / len(user_rl), 4) if user_rl else 0.0
 
+        user_prompt_files = [prompt_files_map[it["item_id"]] for it in user["held_out_items"] if it["item_id"] in prompt_files_map]
         user_result = {
             "user_id": uid,
-            "prompt_file": prompt_file,
+            "prompt_file": user_prompt_files[0] if user_prompt_files else run_prompts_dir,
+            "prompt_files": user_prompt_files,
             "items": user_items_evaluated,
             "user_averages": {
                 "avg_bleu": avg_bleu,

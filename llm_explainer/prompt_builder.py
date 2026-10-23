@@ -1,6 +1,6 @@
 """
 Prompt builder module for generating LLM explanation prompts in English.
-Formats user history across domains, presents recommended items from DGCDR,
+Formats user history across domains, presents a single recommended item from DGCDR,
 enforces JSON response schema, and saves each prompt to a dedicated file.
 """
 
@@ -16,18 +16,6 @@ TARGET_DOMAIN_PROFILES: Dict[str, Dict[str, Any]] = {
             "e.g., battery longevity, sound clarity, connector sturdiness, cable length, "
             "screen resolution, portability, ease of setup, heat management"
         ),
-        # V1 legacy few-shots
-        "few_shot_poor": (
-            '"Based on your cross-domain profile transferred by the DGCDR model, this product matches '
-            'your preferences for electronics. It satisfies the behavioral patterns detected in your previous purchases."'
-        ),
-        "few_shot_good": (
-            '"Given your active daily routine and preference for durable, hassle-free gear, this 6ft cable '
-            'gives you the extra reach needed to use your devices comfortably while charging without straining the connectors. '
-            'The reinforced braided design and reliable 60W power delivery ensure long-lasting durability, whether at your desk or on the go."'
-        ),
-        "few_shot_note": "Mentions specific physical attributes (6ft length, reinforced connectors, 60W speed) that reflect what real users review in electronics.",
-        # V2 formal multi few-shots
         "few_shots_poor_v2": [
             (
                 '"This versatile solution is the ultimate companion to elevate your daily routine. '
@@ -64,29 +52,24 @@ TARGET_DOMAIN_PROFILES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "Cloth": {
-        # --- CASO DOMINIO CLOTHING (da completare in seguito) ---
         "domain_label": "Clothing, Shoes & Jewelry",
-        "concrete_attributes": "",  # TODO: inserire attributi concreti per abbigliamento (es. fit, tessuto, comfort)
-        "few_shot_poor": "",        # TODO: esempio negativo per abbigliamento
-        "few_shot_good": "",        # TODO: esempio positivo per abbigliamento
-        "few_shot_note": "",
+        "concrete_attributes": "",  # TODO: attributi concreti per abbigliamento (es. fit, tessuto, comfort)
+        "few_shots_poor_v2": [],
+        "few_shots_good_v2": [],
     },
     "Sport": {
-        # --- CASO DOMINIO SPORTS & OUTDOORS (da completare in seguito) ---
         "domain_label": "Sports & Outdoors",
-        "concrete_attributes": "",  # TODO: inserire attributi concreti per sport (es. grip, traspirabilità, resistenza)
-        "few_shot_poor": "",        # TODO: esempio negativo per sport
-        "few_shot_good": "",        # TODO: esempio positivo per sport
-        "few_shot_note": "",
+        "concrete_attributes": "",  # TODO: attributi concreti per sport (es. grip, traspirabilità, resistenza)
+        "few_shots_poor_v2": [],
+        "few_shots_good_v2": [],
     },
 }
 
-DEFAULT_DOMAIN_PROFILE: Dict[str, str] = {
+DEFAULT_DOMAIN_PROFILE: Dict[str, Any] = {
     "domain_label": "Target Domain",
     "concrete_attributes": "",
-    "few_shot_poor": "",
-    "few_shot_good": "",
-    "few_shot_note": "",
+    "few_shots_poor_v2": [],
+    "few_shots_good_v2": [],
 }
 
 
@@ -105,20 +88,20 @@ def resolve_target_domain_key(target_domain_name: str) -> str:
     return "Default"
 
 
-def build_user_prompt(
+def build_item_prompt(
     user_id: str,
     source_domain_name: str,
     target_domain_name: str,
     source_history: List[Dict],
     target_history: List[Dict],
-    recommended_items: List[Dict],
+    target_item: Dict,
     prompts_dir: Optional[str] = None,
     prompt_version: str = "v2",
 ) -> Tuple[str, Optional[str]]:
     """
-    Builds a comprehensive, personalized prompt in English for a single user,
-    dynamically tailored to the target domain and prompt version (v1 or v2).
-    Also saves the prompt text to prompts_dir/prompt_<user_id>.txt if prompts_dir is provided.
+    Builds a personalized prompt in English for a single recommended item,
+    tailored to the target domain using pragmatic real-world instructions.
+    Saves the prompt text to prompts_dir/prompt_<user_id>_<item_id>.txt if prompts_dir is provided.
 
     Returns:
         (prompt_text, saved_file_path)
@@ -127,16 +110,10 @@ def build_user_prompt(
     domain_profile = TARGET_DOMAIN_PROFILES.get(domain_key, DEFAULT_DOMAIN_PROFILE)
 
     lines = []
-    if (prompt_version or "").strip().lower() == "v1":
-        lines.append("You are an expert personal shopping assistant and product specialist.")
-        lines.append(
-            f"Your goal is to write natural, compelling, and personalized product recommendations for items in {target_domain_name}."
-        )
-    else:
-        lines.append("You are an objective consumer experience analyst and pragmatic product reviewer.")
-        lines.append(
-            f"Your goal is to explain why items in {target_domain_name} specifically fit this user based on real-world utility, verified physical characteristics, and practical daily performance."
-        )
+    lines.append("You are an objective consumer experience analyst and pragmatic product reviewer.")
+    lines.append(
+        f"Your goal is to explain why items in {target_domain_name} specifically fit this user based on real-world utility, verified physical characteristics, and practical daily performance."
+    )
     lines.append("")
     lines.append("Scenario:")
     lines.append(f"- Source Domain: {source_domain_name}")
@@ -182,18 +159,17 @@ def build_user_prompt(
             lines.append(f"   Review Text: {rev_text}")
             lines.append("")
 
-    # 3. Recommended Items (The 20% held-out target items)
+    # 3. Recommended Item (The single held-out target item)
     lines.append("=" * 60)
-    lines.append("RECOMMENDED ITEMS TO EXPLAIN")
+    lines.append("RECOMMENDED ITEM TO EXPLAIN")
     lines.append("=" * 60)
     lines.append(
-        f"The following items have been recommended for the user in {target_domain_name}:"
+        f"The following item has been recommended for the user in {target_domain_name}:"
     )
     lines.append("")
-    for idx, item in enumerate(recommended_items, 1):
-        lines.append(f"{idx}. Item ID: {item['item_id']}")
-        lines.append(f"   Item Title: {item.get('item_title', 'Unknown Title')}")
-        lines.append("")
+    lines.append(f"Item ID: {target_item['item_id']}")
+    lines.append(f"Item Title: {target_item.get('item_title', 'Unknown Title')}")
+    lines.append("")
 
     # 4. Instructions and Guidelines
     lines.append("=" * 60)
@@ -201,74 +177,47 @@ def build_user_prompt(
     lines.append("=" * 60)
     attr_hint = domain_profile.get("concrete_attributes", "").strip()
 
-    if (prompt_version or "").strip().lower() == "v1":
+    lines.append(
+        "For the recommended item, explain what practical features, ergonomic details, setup ease, and real-world performance qualities this specific user will value."
+    )
+    lines.append("")
+    lines.append("Follow these strict rules:")
+    lines.append("1. CONCRETE REAL-WORLD UTILITY:")
+    if attr_hint:
         lines.append(
-            "For each recommended item, explain what practical features, ergonomic details, and performance qualities this specific user will appreciate."
+            f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review ({attr_hint})."
         )
-        lines.append("")
-        lines.append("Follow these strict rules:")
-        lines.append("1. FOCUS ON CONCRETE PRODUCT ATTRIBUTES:")
-        if attr_hint:
-            lines.append(f"   - Anticipate what would make this user leave a 5-star review ({attr_hint}).")
-        else:
-            lines.append(f"   - Anticipate what would make this user leave a 5-star review for products in {target_domain_name}.")
-        lines.append(
-            "   - Relate these attributes to the traits the user consistently praised in past purchases (e.g., comfort, long-term durability, hassle-free daily setup)."
-        )
-        lines.append("")
-        lines.append("2. NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):")
-        lines.append("   - Do NOT mention 'DGCDR', 'recommendation algorithm', 'cross-domain model', or 'graph'.")
-        lines.append(
-            "   - Do NOT start every sentence with repetitive meta-phrases like 'Based on your history' or 'The system recommended this because'."
-        )
-        lines.append("   - Speak directly, naturally, and conversationally to the user ('You\\'ll appreciate...', 'This offers...').")
-        lines.append("")
-        lines.append("3. LENGTH:")
-        lines.append("   - Strictly 2 to 3 concise, punchy sentences per item.")
-        lines.append("")
     else:
         lines.append(
-            "For each recommended item, explain what practical features, ergonomic details, setup ease, and real-world performance qualities this specific user will value."
+            f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review for products in {target_domain_name}."
         )
-        lines.append("")
-        lines.append("Follow these strict rules:")
-        lines.append("1. CONCRETE REAL-WORLD UTILITY:")
-        if attr_hint:
-            lines.append(
-                f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review ({attr_hint})."
-            )
-        else:
-            lines.append(
-                f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review for products in {target_domain_name}."
-            )
-        lines.append(
-            "   - Ground these benefits in the user's prior interaction history (e.g., relate them to traits the user consistently praised in past purchases, such as build quality, comfort, durability, or low-maintenance daily reliability)."
-        )
-        lines.append("")
-        lines.append("2. NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):")
-        lines.append(
-            "   - Avoid generic marketing buzzwords such as 'seamless functionality', 'dependable companion', 'versatile solution', 'elevate your routine', 'game changer', or 'must-have addition', unless tied directly to a specific physical feature."
-        )
-        lines.append("   - Do NOT mention 'DGCDR', 'recommendation algorithm', 'cross-domain model', or 'graph'.")
-        lines.append(
-            "   - Do NOT start every sentence with repetitive meta-phrases like 'Based on your history' or 'The system recommended this because'."
-        )
-        lines.append(
-            "   - Vary sentence structures across recommendations. Do NOT repeat formulaic openings such as 'Given your preference for...' or 'Considering your appreciation for...'. State the item's concrete qualities and practical benefits directly in clear, formal English."
-        )
-        lines.append("   - Speak directly, naturally, and objectively to the user ('You\\'ll appreciate...', 'This provides...').")
-        lines.append("")
-        lines.append("3. LENGTH & FOCUS:")
-        lines.append("   - Strictly 2 to 3 concise, information-dense sentences per item.")
-        lines.append("   - Focus strictly on tangible user experience and functional durability rather than promotional sales copy.")
-        lines.append("")
+    lines.append(
+        "   - Ground these benefits in the user's prior interaction history (e.g., relate them to traits the user consistently praised in past purchases, such as build quality, comfort, durability, or low-maintenance daily reliability)."
+    )
+    lines.append("")
+    lines.append("2. NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):")
+    lines.append(
+        "   - Avoid generic marketing buzzwords such as 'seamless functionality', 'dependable companion', 'versatile solution', 'elevate your routine', 'game changer', or 'must-have addition', unless tied directly to a specific physical feature."
+    )
+    lines.append("   - Do NOT mention 'DGCDR', 'recommendation algorithm', 'cross-domain model', or 'graph'.")
+    lines.append(
+        "   - Do NOT start every sentence with repetitive meta-phrases like 'Based on your history' or 'The system recommended this because'."
+    )
+    lines.append(
+        "   - State the item's concrete qualities and practical benefits directly in clear, formal English without formulaic openings."
+    )
+    lines.append("   - Speak directly, naturally, and objectively to the user ('You\\'ll appreciate...', 'This provides...').")
+    lines.append("")
+    lines.append("3. LENGTH & FOCUS:")
+    lines.append("   - Strictly less than 50 words, using information-dense sentences.")
+    lines.append("   - Focus strictly on tangible user experience and functional durability rather than promotional sales copy.")
+    lines.append("")
 
     # 5. Few-Shot Demonstrations (if defined for the target domain)
-    is_v1 = (prompt_version or "").strip().lower() == "v1"
-    few_shots_good_v2 = domain_profile.get("few_shots_good_v2")
-    few_shots_poor_v2 = domain_profile.get("few_shots_poor_v2")
+    few_shots_good_v2 = domain_profile.get("few_shots_good_v2", [])
+    few_shots_poor_v2 = domain_profile.get("few_shots_poor_v2", [])
 
-    if not is_v1 and few_shots_good_v2:
+    if few_shots_good_v2:
         lines.append("=" * 60)
         lines.append("EXAMPLES OF EXPECTED FORMAL STYLE (FEW-SHOT DEMONSTRATIONS)")
         lines.append("=" * 60)
@@ -284,25 +233,6 @@ def build_user_prompt(
             if note:
                 lines.append(f"   -> Note: {note}")
         lines.append("")
-    else:
-        # Fallback / V1 baseline few-shot
-        few_shot_good = domain_profile.get("few_shot_good", "").strip()
-        few_shot_poor = domain_profile.get("few_shot_poor", "").strip()
-        few_shot_note = domain_profile.get("few_shot_note", "").strip()
-        if few_shot_good:
-            lines.append("=" * 60)
-            lines.append("EXAMPLES OF EXPECTED STYLE (FEW-SHOT DEMONSTRATIONS)")
-            lines.append("=" * 60)
-            if few_shot_poor:
-                lines.append("[POOR STYLE - DO NOT WRITE LIKE THIS]:")
-                lines.append(few_shot_poor)
-                lines.append("-> Reason: Empty algorithmic jargon, zero mentions of actual product features.")
-                lines.append("")
-            lines.append("[EXCELLENT STYLE - WRITE LIKE THIS]:")
-            lines.append(few_shot_good)
-            if few_shot_note:
-                lines.append(f"-> Reason: {few_shot_note}")
-            lines.append("")
 
     # 6. Output Format and JSON Schema
     lines.append("=" * 60)
@@ -313,17 +243,12 @@ def build_user_prompt(
     )
     lines.append("")
 
-    # Build schema example matching actual recommended items
-    example_explanations = []
-    for it in recommended_items:
-        example_explanations.append(
-            {
-                "item_id": it["item_id"],
-                "item_title": it.get("item_title", ""),
-                "explanation": f"<Write the personalized explanation in English for item {it['item_id']} here>",
-            }
-        )
-    example_json = json.dumps({"explanations": example_explanations}, indent=2)
+    example_obj = {
+        "item_id": target_item["item_id"],
+        "item_title": target_item.get("item_title", ""),
+        "explanation": f"<Write the personalized explanation in English for item {target_item['item_id']} here (strictly under 50 words)>",
+    }
+    example_json = json.dumps(example_obj, indent=2)
     lines.append(example_json)
 
     prompt_text = "\n".join(lines)
@@ -332,11 +257,39 @@ def build_user_prompt(
     saved_path = None
     if prompts_dir:
         os.makedirs(prompts_dir, exist_ok=True)
-        # Clean user_id for filename
-        safe_uid = "".join(c for c in user_id if c.isalnum() or c in ("-", "_"))
-        saved_path = os.path.join(prompts_dir, f"prompt_{safe_uid}.txt")
+        # Clean identifiers for safe filename
+        safe_uid = "".join(c for c in str(user_id) if c.isalnum() or c in ("-", "_"))
+        safe_iid = "".join(c for c in str(target_item["item_id"]) if c.isalnum() or c in ("-", "_"))
+        saved_path = os.path.join(prompts_dir, f"prompt_{safe_uid}_{safe_iid}.txt")
         with open(saved_path, "w", encoding="utf-8") as f:
             f.write(prompt_text)
 
     return prompt_text, saved_path
 
+
+def build_user_prompt(
+    user_id: str,
+    source_domain_name: str,
+    target_domain_name: str,
+    source_history: List[Dict],
+    target_history: List[Dict],
+    recommended_items: List[Dict],
+    prompts_dir: Optional[str] = None,
+    prompt_version: str = "v2",
+) -> Tuple[str, Optional[str]]:
+    """
+    Backward-compatibility wrapper for build_item_prompt.
+    If multiple items are passed, builds prompt for the first item.
+    """
+    if recommended_items:
+        return build_item_prompt(
+            user_id=user_id,
+            source_domain_name=source_domain_name,
+            target_domain_name=target_domain_name,
+            source_history=source_history,
+            target_history=target_history,
+            target_item=recommended_items[0],
+            prompts_dir=prompts_dir,
+            prompt_version=prompt_version,
+        )
+    return "", None

@@ -218,7 +218,10 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
         
         md.append(f"### User {idx}/{len(users)}: `{uid}`")
         if prompt_f:
-            md.append(f"- **Prompt File:** `{prompt_f}`")
+            if isinstance(prompt_f, list):
+                md.append(f"- **Prompt Files:** `{len(prompt_f)} individual prompt files generated`")
+            else:
+                md.append(f"- **Prompt File:** `{prompt_f}`")
         
         avg_line = (
             f"- **User Averages:** BLEU: `{_format_score(u_avgs.get('avg_bleu'))}` | "
@@ -246,6 +249,9 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
 
             md.append(f"#### Item {item_idx}: {title}")
             md.append(f"- **Item ID:** `{iid}` | **Quintile:** `{qid} ({qlabel})` | **Review Words:** `{w_count}`")
+            item_p_file = it.get("prompt_file")
+            if item_p_file:
+                md.append(f"- **Prompt File:** `{item_p_file}`")
             
             it_metric_line = (
                 f"- **Metrics:** BLEU: `{_format_score(m.get('bleu'))}` | "
