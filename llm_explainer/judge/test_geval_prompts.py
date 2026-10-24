@@ -304,6 +304,7 @@ def extract_users_from_results(
         "quintile_schema": quintile_schema,
         "is_shuffled": data.get("is_shuffled", False),
         "shuffle_info": data.get("shuffle_info", {}),
+        "domain_pair": domain_pair,
     }
 
     return extracted, stats
@@ -596,8 +597,9 @@ def evaluate_single_metric(
     shuffled_tag = "_shuffled" if is_shuffled_data else ""
 
     clean_model_name = args.model.replace(":", "_").replace("/", "_")
-    json_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.json"
-    md_filename = f"geval_Cloth-Elec_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.md"
+    domain_pair = stats.get("domain_pair", "Cloth-Elec")
+    json_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.json"
+    md_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.md"
     json_output_path = os.path.join(args.output_dir, json_filename)
     md_output_path = os.path.join(args.output_dir, md_filename)
 
@@ -837,8 +839,8 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="results_judge/Cloth-Elec",
-        help="Directory to save JSON and MD output files (default: results_judge/Cloth-Elec)",
+        default=None,
+        help="Directory to save JSON and MD output files (default: results_judge/<domain_pair>)",
     )
     args = parser.parse_args()
 
@@ -847,9 +849,6 @@ def main():
         candidate_res = os.path.join(REPO_ROOT, args.results_file)
         if os.path.exists(candidate_res):
             args.results_file = candidate_res
-
-    if not os.path.isabs(args.output_dir):
-        args.output_dir = os.path.join(REPO_ROOT, args.output_dir)
 
     # Risoluzione metriche selezionate
     all_metric_keys = list(METRICS_REGISTRY.keys())
@@ -866,7 +865,6 @@ def main():
                 print(f"[ERRORE] Metrica '{m}' non valida. Scegli tra: {all_metric_keys} o 'all'.")
                 sys.exit(1)
 
-    os.makedirs(args.output_dir, exist_ok=True)
     instance_template = load_text(args.instance_prompt)
     users_data, stats = extract_users_from_results(
         args.results_file,
@@ -877,6 +875,15 @@ def main():
     if not users_data:
         print("Nessun utente valido estratto. Verifica i filtri o il file di input.")
         sys.exit(1)
+
+    # Risoluzione cartella di output dinamica in base al domain_pair
+    if args.output_dir is None:
+        domain_pair = stats.get("domain_pair", "Cloth-Elec")
+        args.output_dir = os.path.join(REPO_ROOT, "results_judge", domain_pair)
+    elif not os.path.isabs(args.output_dir):
+        args.output_dir = os.path.join(REPO_ROOT, args.output_dir)
+
+    os.makedirs(args.output_dir, exist_ok=True)
 
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
