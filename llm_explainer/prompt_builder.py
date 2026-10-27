@@ -23,7 +23,7 @@ TARGET_DOMAIN_PROFILES: Dict[str, Dict[str, Any]] = {
                 "Empty commercial buzzwords with zero mention of tangible product features, build quality, or real-world utility.",
             ),
             (
-                '"Based on your cross-domain profile transferred by the DGCDR model, this product '
+                '"Based on your cross-domain profile, this product '
                 'satisfies the behavioral patterns detected in your previous purchases."',
                 "Robotic system jargon. It describes the recommendation algorithm rather than providing meaningful product context to the user.",
             ),
@@ -97,6 +97,7 @@ def build_item_prompt(
     target_item: Dict,
     prompts_dir: Optional[str] = None,
     prompt_version: str = "v2",
+    include_few_shots: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """
     Builds a personalized prompt in English for a single recommended item,
@@ -110,9 +111,9 @@ def build_item_prompt(
     domain_profile = TARGET_DOMAIN_PROFILES.get(domain_key, DEFAULT_DOMAIN_PROFILE)
 
     lines = []
-    lines.append("You are an objective consumer experience analyst and pragmatic product reviewer.")
+    lines.append("Act as an objective consumer experience analyst and pragmatic product reviewer.")
     lines.append(
-        f"Your goal is to explain why items in {target_domain_name} specifically fit this user based on real-world utility, verified physical characteristics, and practical daily performance."
+        f"Your goal is to explain why items in {target_domain_name} specifically fit this user interests and values."
     )
     lines.append("")
     lines.append("Scenario:")
@@ -120,7 +121,7 @@ def build_item_prompt(
     lines.append(f"- Target Domain: {target_domain_name}")
     lines.append("")
     lines.append(
-        "Below is the user's cross-domain profile. Pay special attention to what the user values in their reviews (e.g., build quality, durability, comfort, practical convenience, daily reliability):"
+        "Below is the user's cross-domain profile. Pay special attention to what the user values in their reviews:"
     )
     lines.append("")
     lines.append("=" * 60)
@@ -175,51 +176,40 @@ def build_item_prompt(
     lines.append("=" * 60)
     lines.append("INSTRUCTIONS & GUIDELINES")
     lines.append("=" * 60)
-    attr_hint = domain_profile.get("concrete_attributes", "").strip()
-
-    lines.append(
-        "For the recommended item, explain what practical features, ergonomic details, setup ease, and real-world performance qualities this specific user will value."
-    )
+    lines.append("For the recommended item, follow these strict rules:")
     lines.append("")
-    lines.append("Follow these strict rules:")
     lines.append("1. CONCRETE REAL-WORLD UTILITY:")
-    if attr_hint:
-        lines.append(
-            f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review ({attr_hint})."
-        )
-    else:
-        lines.append(
-            f"   - Explain what specific real-world benefits, ergonomics, setup ease, and practical performance aspects a real user will highlight in a 5-star review for products in {target_domain_name}."
-        )
     lines.append(
-        "   - Ground these benefits in the user's prior interaction history (e.g., relate them to traits the user consistently praised in past purchases, such as build quality, comfort, durability, or low-maintenance daily reliability)."
+        "   - Explain what specific real-world benefits and practical aspects a real user could value and highlight."
+    )
+    lines.append(
+        "   - Ground these benefits in the user's prior interaction history (e.g., relate them to traits the user consistently praised in past purchases)."
+    )
+    lines.append(
+        "   - Pay attention on verifiable physical characteristics that the user could value given its history."
     )
     lines.append("")
-    lines.append("2. NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):")
+    lines.append("2. NEGATIVE CONSTRAINTS:")
     lines.append(
         "   - Avoid generic marketing buzzwords such as 'seamless functionality', 'dependable companion', 'versatile solution', 'elevate your routine', 'game changer', or 'must-have addition', unless tied directly to a specific physical feature."
     )
-    lines.append("   - Do NOT mention 'DGCDR', 'recommendation algorithm', 'cross-domain model', or 'graph'.")
     lines.append(
         "   - Do NOT start every sentence with repetitive meta-phrases like 'Based on your history' or 'The system recommended this because'."
     )
-    lines.append(
-        "   - State the item's concrete qualities and practical benefits directly in clear, formal English without formulaic openings."
-    )
-    lines.append("   - Speak directly, naturally, and objectively to the user ('You\\'ll appreciate...', 'This provides...').")
     lines.append("")
     lines.append("3. LENGTH & FOCUS:")
     lines.append("   - Strictly less than 50 words, using information-dense sentences.")
-    lines.append("   - Focus strictly on tangible user experience and functional durability rather than promotional sales copy.")
+    lines.append("   - Focus strictly on tangible user experience.")
+    lines.append("   - Speak directly, naturally, and objectively to the user.")
     lines.append("")
 
-    # 5. Few-Shot Demonstrations (if defined for the target domain)
+    # 5. Few-Shot Demonstrations (if enabled and defined for the target domain)
     few_shots_good_v2 = domain_profile.get("few_shots_good_v2", [])
     few_shots_poor_v2 = domain_profile.get("few_shots_poor_v2", [])
 
-    if few_shots_good_v2:
+    if include_few_shots and few_shots_good_v2:
         lines.append("=" * 60)
-        lines.append("EXAMPLES OF EXPECTED FORMAL STYLE (FEW-SHOT DEMONSTRATIONS)")
+        lines.append("EXAMPLES OF EXPECTED FORMAL STYLE")
         lines.append("=" * 60)
         if few_shots_poor_v2:
             lines.append("[POOR STYLE - DO NOT WRITE LIKE THESE]:")
@@ -276,6 +266,7 @@ def build_user_prompt(
     recommended_items: List[Dict],
     prompts_dir: Optional[str] = None,
     prompt_version: str = "v2",
+    include_few_shots: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """
     Backward-compatibility wrapper for build_item_prompt.
@@ -291,5 +282,6 @@ def build_user_prompt(
             target_item=recommended_items[0],
             prompts_dir=prompts_dir,
             prompt_version=prompt_version,
+            include_few_shots=include_few_shots,
         )
     return "", None

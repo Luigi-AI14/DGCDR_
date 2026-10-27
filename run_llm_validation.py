@@ -102,6 +102,12 @@ def parse_args():
         help="Prompt version identifier (default: v2).",
     )
     parser.add_argument(
+        "--no_few_shot",
+        action="store_true",
+        default=DEFAULT_SETTINGS.get("no_few_shot", False),
+        help="Remove few-shot demonstration examples from the LLM prompt (default: few-shots included).",
+    )
+    parser.add_argument(
         "--ollama_url",
         type=str,
         default=DEFAULT_SETTINGS["ollama_url"],
@@ -240,6 +246,7 @@ def main():
     print(f"Held-out Min Words:  >= {args.min_review_words} words (including title)")
     print(f"Sampling Strategy:   Uniform random distribution (seed={args.seed})")
     print(f"Prompt Version:      {args.prompt_version}")
+    print(f"Few-Shot Examples:   {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"SBERT Batch Size:    {args.sbert_batch_size}")
@@ -286,10 +293,11 @@ def main():
     )
 
     # 2.5 Initialize LLM Explanation cache
+    cache_prompt_ver = f"{args.prompt_version}_no_few_shot" if args.no_few_shot else args.prompt_version
     expl_cache = ExplanationCache(
         domain_pair=args.domain_pair,
         model_name=args.model,
-        prompt_version=args.prompt_version,
+        prompt_version=cache_prompt_ver,
     )
     if not args.no_cache_llm:
         logger.info(
@@ -325,6 +333,8 @@ def main():
     clean_version = sanitize_model_name(args.prompt_version) if args.prompt_version else ""
     is_v1 = not clean_version or clean_version.lower() == "v1"
     version_suffix = "" if is_v1 else f"_{clean_version}"
+    if args.no_few_shot:
+        version_suffix += "_no_few_shot"
     model_folder = f"{clean_model}{version_suffix}"
 
     output_basename = f"{args.domain_pair}_{model_folder}_{run_timestamp}"
@@ -391,6 +401,7 @@ def main():
                     target_item=target_item_dict,
                     prompts_dir=run_prompts_dir,
                     prompt_version=args.prompt_version,
+                    include_few_shots=not args.no_few_shot,
                 )
                 prompt_files_map[iid] = p_file
         else:
@@ -410,6 +421,7 @@ def main():
                     target_item=target_item_dict,
                     prompts_dir=run_prompts_dir,
                     prompt_version=args.prompt_version,
+                    include_few_shots=not args.no_few_shot,
                 )
                 prompt_files_map[iid] = p_file
 
@@ -768,6 +780,7 @@ def main():
         "target_domain": users_data[0]["target_domain"],
         "model": args.model,
         "prompt_version": args.prompt_version,
+        "no_few_shot": args.no_few_shot,
         "sbert_model": args.sbert_model,
         "bertscore_model": args.bertscore_model if not args.no_bertscore else None,
         "bertscore_rescale_with_baseline": args.bertscore_rescale_baseline if not args.no_bertscore else None,
@@ -796,6 +809,7 @@ def main():
     print(f"Total Users Evaluated:           {len(users_data)}")
     print(f"Total Held-Out Items Evaluated:  {len(global_bleu_scores)}")
     print(f"Prompt Version:                  {args.prompt_version}")
+    print(f"Few-Shot Demonstrations:         {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"Macro Average BLEU:              {macro_bleu:.4f}")
     print(f"Macro Average ROUGE-1 (F1):      {macro_r1:.4f}")
     print(f"Macro Average ROUGE-2 (F1):      {macro_r2:.4f}")
