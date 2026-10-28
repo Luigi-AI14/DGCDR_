@@ -1,38 +1,25 @@
 #!/usr/bin/env python3
-"""
-Test script for evaluating custom G-Eval System and Instance prompts with Ollama (llama3.1:8b).
+"""Review-alignment judge: separate system/instance prompts, strict JSON and nullable scores.
 
-Features:
-- Metric: 'Alignment' (Contrastive review vs explanation evaluation)
-- Two-stage CoT (Reasoning before vote):
-    1. LLM generates 1-2 sentences of contrastive reasoning (printed to terminal, not saved to file)
-    2. LLM outputs final Alignment score (1-5)
-- Extraction of score token log-probabilities via Ollama's OpenAI-compatible endpoint (/v1/chat/completions)
-  conditioned on the generated reasoning.
-- Exact G-Eval mathematical formulation (Liu et al., EMNLP 2023).
-- Excludes ultra-short reviews (< 5 words) to avoid synthetic evaluation skew.
-- Quintile review length stratification analysis (Q1-Q5: Micro, Short, Medium, Detailed, In-Depth).
-- Prompt template sanitization: removes [Product Information] to evaluate purely against user reviews.
-- Separate output files (.json and .md) saved in 'results_judge/Cloth-Elec/'.
-- Outputs global mean score, weighted score, quintile stratification breakdown,
-  per-user averages, and item-level details.
+The historical G-Eval filenames and weighted fields are retained for compatibility.
+Probability-weighted scoring is not computed by this JSON protocol.
 """
 
 import argparse
 import datetime
+import hashlib
 import json
-import math
 import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure repository root is on sys.path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts
 
 try:
     from llm_explainer.quintiles import QuintileManager, count_words
@@ -78,7 +65,7 @@ def load_text(file_path: str) -> str:
                 file_path = candidate_prompt
             else:
                 raise FileNotFoundError(f"File non trovato: {file_path}")
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8-sig") as f:
         return f.read().strip()
 
 
@@ -176,9 +163,7 @@ def format_instance_prompt(
     item_title: Optional[str] = None,
 ) -> str:
     """
-    Formats the instance prompt, replacing item fields and ensuring
-    the evaluation form specifies the active metric name.
-    Preserves backward compatibility if {item_title} is still in the template.
+    Formats the three input fields. Legacy item-title aliases remain supported.
     """
     content = template
 
@@ -223,6 +208,7 @@ def extract_users_from_results(
 
     total_source_items = 0
     filtered_ultrashort_items = 0
+    skipped_missing_input_items = 0
     valid_items_count = 0
 
     extracted = []
@@ -237,6 +223,7 @@ def extract_users_from_results(
             explanation = it.get("llm_explanation", "").strip()
 
             if not item_title or not rev_text or not explanation:
+                skipped_missing_input_items += 1
                 continue
 
             # Review word count
@@ -300,6 +287,7 @@ def extract_users_from_results(
         "total_source_items": total_source_items,
         "valid_items_count": valid_items_count,
         "filtered_ultrashort_items": filtered_ultrashort_items,
+        "skipped_missing_input_items": skipped_missing_input_items,
         "min_words_filter": min_words,
         "quintile_schema": quintile_schema,
         "is_shuffled": data.get("is_shuffled", False),
@@ -310,146 +298,11 @@ def extract_users_from_results(
     return extracted, stats
 
 
-def call_ollama_with_logprobs(
-    system_prompt: str,
-    instance_prompt: str,
-    model: str = "llama3.1:8b",
-    temperature: float = 0.0,
-    seed: int = 42,
-    ollama_url: str = "http://localhost:11434",
-    timeout: int = 180,
-    top_logprobs: int = 20,
-    max_tokens: int = 150,
-    stop: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Calls Ollama via the /api/chat endpoint with think=False and logprobs=True.
-    Supports two-stage CoT (Reasoning followed by Alignment score).
-    Extracts token probabilities for scores 1-5 conditioned on the generated reasoning.
-    """
-    endpoint = f"{ollama_url.rstrip('/')}/api/chat"
-
-    options_dict: Dict[str, Any] = {
-        "temperature": temperature,
-        "seed": seed,
-        "num_predict": max_tokens,
-    }
-    if stop:
-        options_dict["stop"] = stop
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": instance_prompt},
-        ],
-        "stream": False,
-        "think": False,
-        "logprobs": True,
-        "top_logprobs": top_logprobs,
-        "options": options_dict,
-    }
-
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            res_data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {
-            "error": str(e),
-            "response_text": f"[ERRORE CHIAMATA OLLAMA: {e}]",
-            "reasoning": "",
-            "discrete_score": None,
-            "weighted_score": None,
-            "norm_probs": {},
-            "raw_probs": {},
-        }
-
-    # Support both native /api/chat and OpenAI /v1/chat/completions response structures
-    if "message" in res_data:
-        msg = res_data.get("message", {})
-        message_content = msg.get("content", "").strip()
-        content_tokens = res_data.get("logprobs", []) or []
-    elif "choices" in res_data:
-        choice = res_data.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        message_content = msg.get("content", "").strip()
-        if not message_content and msg.get("reasoning"):
-            message_content = msg.get("reasoning", "").strip()
-        logprobs_obj = choice.get("logprobs", {})
-        content_tokens = logprobs_obj.get("content", []) if logprobs_obj else []
-    else:
-        message_content = ""
-        content_tokens = []
-
-    # Estrazione del reasoning e dello score discreto dal testo generato
-    score_match = re.search(r"(?:Alignment|Score):\s*([1-5])\b", message_content, re.IGNORECASE)
-    if score_match:
-        discrete_score = int(score_match.group(1))
-        reasoning_text = message_content[:score_match.start()].strip()
-        if reasoning_text.lower().startswith("reasoning:"):
-            reasoning_text = reasoning_text[len("reasoning:"):].strip()
-    else:
-        # Fallback: cerca l'ultima cifra 1-5 nel testo generato
-        all_digits = re.findall(r"\b([1-5])\b", message_content)
-        discrete_score = int(all_digits[-1]) if all_digits else None
-        reasoning_text = message_content.strip()
-
-    # Localizza il token corrispondente allo score nei logprob (cercando a ritroso dalla fine)
-    matched_tok = None
-    if discrete_score is not None:
-        target_str = str(discrete_score)
-        for tok_info in reversed(content_tokens):
-            tok_clean = tok_info.get("token", "").strip()
-            if tok_clean == target_str:
-                matched_tok = tok_info
-                break
-
-    raw_probs = {i: 0.0 for i in range(1, 6)}
-    score_token_found = False
-
-    if matched_tok is not None:
-        score_token_found = True
-        for top_t in matched_tok.get("top_logprobs", []):
-            cand_clean = top_t.get("token", "").strip()
-            if cand_clean in ["1", "2", "3", "4", "5"]:
-                cand_val = int(cand_clean)
-                lp = top_t.get("logprob")
-                if lp is not None:
-                    raw_probs[cand_val] = math.exp(lp)
-
-    # Calcolo G-Eval normalizzato: p(S = i) = P(i) / sum(P(j))
-    total_p = sum(raw_probs.values())
-    if total_p > 0 and score_token_found:
-        norm_probs = {i: raw_probs[i] / total_p for i in range(1, 6)}
-        weighted_score = sum(i * norm_probs[i] for i in range(1, 6))
-    else:
-        norm_probs = {i: (1.0 if i == discrete_score else 0.0) for i in range(1, 6)}
-        weighted_score = float(discrete_score) if discrete_score is not None else None
-
-    return {
-        "error": None,
-        "response_text": message_content,
-        "reasoning": reasoning_text,
-        "discrete_score": discrete_score,
-        "weighted_score": round(weighted_score, 4) if weighted_score is not None else None,
-        "norm_probs": {i: round(norm_probs[i], 4) for i in range(1, 6)},
-        "raw_probs": {i: round(raw_probs[i], 6) for i in range(1, 6)},
-        "score_token_found": score_token_found,
-    }
-
-
 def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users: List[Dict[str, Any]]) -> None:
     """
     Saves results to a JSON file.
     Contains global mean score, global mean weighted score, and quintile stratification.
-    Detailed items do NOT include CoT reasoning (clean evaluation output).
+    Includes judge reasons, response statuses and raw attempt diagnostics.
     """
     payload = {
         "global_mean_score": summary["global_mean_score"],
@@ -458,6 +311,7 @@ def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users
         "total_items_evaluated": summary["total_items_evaluated"],
         "total_items_in_source": summary.get("total_items_in_source", summary["total_items_evaluated"]),
         "filtered_ultrashort_items": summary.get("filtered_ultrashort_items", 0),
+        "skipped_missing_input_items": summary.get("skipped_missing_input_items", 0),
         "min_review_words_filter": summary.get("min_review_words_filter", 5),
         "quintile_metrics": summary.get("quintile_metrics", {}),
         "metadata": {
@@ -467,7 +321,11 @@ def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users
             "temperature": summary["temperature"],
             "timestamp": summary["timestamp"],
             "source_results": summary["source_results"],
+            **summary["protocol_metadata"],
         },
+        "judgment_counts": summary["judgment_counts"],
+        "is_shuffled": summary.get("is_shuffled", False),
+        "shuffle_info": summary.get("shuffle_info", {}),
         "users": evaluated_users,
     }
 
@@ -480,23 +338,30 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
     """
     Saves results to a Markdown (.md) file.
     Contains global mean score, global mean weighted score, quintile stratification table,
-    and detailed items per user without CoT text.
+    and detailed items including reasons and assessment statuses.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 
     mean_s_str = f"{summary['global_mean_score']:.4f} / 5" if summary["global_mean_score"] is not None else "N/A"
     mean_w_str = f"{summary['global_mean_weighted_score']:.4f} / 5.0" if summary["global_mean_weighted_score"] is not None else "N/A"
     min_w = summary.get("min_review_words_filter", 5)
+    counts = summary["judgment_counts"]
 
     lines = [
-        f"# G-Eval Evaluation Report: {summary['metric_name']}\n",
+        f"# Review Alignment Evaluation Report: {summary['metric_name']}\n",
         "## Global Summary",
         f"- **Metric**: `{summary['metric_name']}` (`{summary['metric_id']}`)",
         f"- **Global Mean Score**: {mean_s_str}",
         f"- **Global Mean Weighted Score**: {mean_w_str}",
+        f"- **Attempted Items**: {counts['attempted_count']}",
+        f"- **Insufficient Evidence**: {counts['insufficient_evidence_count']}",
+        f"- **Technical Failures**: {counts['failed_count']}",
+        f"- **Score Coverage**: {counts['score_coverage_pct']}%",
+        "- Weighted scores are not computed by this judge protocol.",
         f"- **Total Users Evaluated**: {summary['total_users_evaluated']}",
         f"- **Total Valid Items Evaluated**: {summary['total_items_evaluated']} (&ge; {min_w} words)",
         f"- **Filtered Ultra-Short Items**: {summary.get('filtered_ultrashort_items', 0)} (< {min_w} words excluded)",
+        f"- **Missing Input Items**: {summary.get('skipped_missing_input_items', 0)}",
         f"- **Total Items in Source**: {summary.get('total_items_in_source', summary['total_items_evaluated'])}",
         f"- **Model**: `{summary['model']}`",
         f"- **Timestamp**: `{summary['timestamp']}`",
@@ -515,8 +380,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
     by_q = qm.get("by_quintile", {})
     if by_q:
         lines.append(f"## Stratified Metrics by Review Length Quintiles (Min Words &ge; {min_w})\n")
-        lines.append("| Quintile | Label | Word Range | Count | % Valid | Avg Words | Mean Score | Mean Weighted Score |")
-        lines.append("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|")
+        lines.append("| Quintile | Label | Word Range | Attempted | % Attempted | Avg Words | Mean Score | Mean Weighted Score | Scored | Insufficient | Failed |")
+        lines.append("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
         for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
             if qid in by_q:
@@ -532,12 +397,15 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
                     f"{q.get('avg_words', 0.0):.1f}",
                     s_str,
                     w_str,
+                    str(q["scored_count"]),
+                    str(q["insufficient_evidence_count"]),
+                    str(q["failed_count"]),
                 ]
                 lines.append("| " + " | ".join(row) + " |")
 
         # Riga di sintesi globale
         lines.append(
-            f"| **Overall Valid (&ge; {min_w}w)** | - | - | {summary['total_items_evaluated']} | 100.0% | - | {mean_s_str} | {mean_w_str} |"
+            f"| **Overall** | - | - | {counts['attempted_count']} | 100.0% | - | {mean_s_str} | {mean_w_str} | {counts['scored_count']} | {counts['insufficient_evidence_count']} | {counts['failed_count']} |"
         )
         lines.append("")
         filtered_cnt = summary.get("filtered_ultrashort_items", 0)
@@ -556,6 +424,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         lines.append(f"### User {u_idx}: `{u['user_id']}`")
         lines.append(f"- **User Mean Score**: {u_mean_s}")
         lines.append(f"- **User Mean Weighted Score**: {u_mean_w}")
+        uc = u["judgment_counts"]
+        lines.append(f"- **Judgments**: {uc['scored_count']} scored, {uc['insufficient_evidence_count']} insufficient, {uc['failed_count']} failed")
         lines.append(f"- **Items Evaluated**: {u['items_count']}\n")
         lines.append("#### Items:")
 
@@ -563,7 +433,12 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
             w_score = f"{it['weighted_score']:.4f} / 5.0" if it.get("weighted_score") is not None else "N/A"
             q_label_str = f"`{it.get('quintile', '-')}` ({it.get('quintile_label', '-')}, {it.get('review_word_count', '-')} words)"
             lines.append(f"##### Item {it_idx} (ID: `{it.get('item_id', '')}`)")
-            lines.append(f"- **Score**: {it['score']} / 5")
+            score_text = f"{it['score']} / 5" if it["score"] is not None else "N/A"
+            lines.append(f"- **Score**: {score_text}")
+            lines.append(f"- **Status**: {it['status']}")
+            lines.append(f"- **Reason**: {it['reason'] or 'N/A'}")
+            if it.get("error"):
+                lines.append(f"- **Error**: {it['error']}")
             lines.append(f"- **Weighted Score**: {w_score}")
             lines.append(f"- **Quintile**: {q_label_str}")
             lines.append(f"- **Item Title**: {it['item_title']}")
@@ -586,12 +461,12 @@ def evaluate_single_metric(
 ) -> Tuple[str, str]:
     """
     Evaluates all users on a single metric, calculates averages and quintile breakdowns,
-    and saves separate .json and .md files. Displays CoT reasoning on terminal without saving it to disk.
+    and saves separate .json and .md files, including reasons and failures.
     Returns (json_path, md_path).
     """
     metric_info = METRICS_REGISTRY[metric_id]
     metric_display_name = metric_info["display_name"]
-    system_prompt = load_metric_prompt(metric_info)
+    system_prompt = load_text(args.system_prompt) if args.system_prompt else load_metric_prompt(metric_info)
 
     is_shuffled_data = stats.get("is_shuffled", False) or any(it.get("is_shuffled") for u in users_data for it in u.get("items", []))
     shuffled_tag = "_shuffled" if is_shuffled_data else ""
@@ -608,7 +483,7 @@ def evaluate_single_metric(
     print(f"  AVVIO VALUTAZIONE METRICA: {metric_display_name.upper()} ({metric_id})")
     print(f"  Utenti validi: {len(users_data)} | Item validi da valutare: {total_valid_items}")
     print(f"  Item ultra-short filtrati (< {stats['min_words_filter']}w): {stats['filtered_ultrashort_items']}")
-    print(f"  Modalita CoT: Reasoning mostrato su terminale (non salvato su file)")
+    print("  Output: JSON reason + alignment_score (1-5 or null); reasons saved")
     print(f"  Output JSON: {json_output_path}")
     print(f"  Output MD:   {md_output_path}")
     print(f"=================================================================\n")
@@ -631,7 +506,7 @@ def evaluate_single_metric(
                 item_title=it["item_title"],
             )
 
-            eval_result = call_ollama_with_logprobs(
+            eval_result = call_ollama_judge(
                 system_prompt=system_prompt,
                 instance_prompt=instance_prompt,
                 model=args.model,
@@ -639,20 +514,20 @@ def evaluate_single_metric(
                 seed=args.seed,
                 ollama_url=args.ollama_url,
                 max_tokens=args.max_tokens,
-                stop=None,
+                num_ctx=args.num_ctx,
+                max_retries=args.max_retries,
             )
 
             if eval_result.get("error"):
                 print(f"    Item #{it_idx} ({it['item_id']}) -> ERRORE: {eval_result['error']}")
-                continue
 
             discrete = eval_result["discrete_score"]
             weighted = eval_result["weighted_score"]
-            reasoning = eval_result.get("reasoning", "")
+            reasoning = eval_result.get("reason", "")
 
             print(
                 f"    Item #{it_idx} ({it['item_id']} | {it['quintile']} {it['quintile_label']}) -> "
-                f"Score: {discrete}/5 | Weighted: {weighted}/5.0"
+                f"Score: {discrete if discrete is not None else 'N/A'} | Status: {eval_result['status']}"
             )
             if reasoning:
                 print(f"      [Reasoning]: {reasoning}")
@@ -662,7 +537,7 @@ def evaluate_single_metric(
             if weighted is not None:
                 global_weighted.append(weighted)
 
-            # Nota: reasoning NON salvato nel record su richiesta dell'utente
+            # Preserve valid nulls and technical failures as distinct outcomes.
             eval_item_entry = {
                 "item_id": it["item_id"],
                 "item_title": it["item_title"],
@@ -673,6 +548,13 @@ def evaluate_single_metric(
                 "explanation": it["explanation"],
                 "score": discrete,
                 "weighted_score": weighted,
+                "weighted_score_status": eval_result["weighted_score_status"],
+                "reason": reasoning,
+                "status": eval_result["status"],
+                "error": eval_result["error"],
+                "response_text": eval_result["response_text"],
+                "done_reason": eval_result["done_reason"],
+                "attempts": eval_result["attempts"],
             }
             if it.get("is_shuffled"):
                 eval_item_entry["is_shuffled"] = True
@@ -699,6 +581,7 @@ def evaluate_single_metric(
             "user_mean_score": u_mean_score,
             "user_mean_weighted_score": u_mean_weighted,
             "items_count": len(user_eval_items),
+            "judgment_counts": judgment_counts(user_eval_items),
             "items": user_eval_items,
         })
 
@@ -741,12 +624,14 @@ def evaluate_single_metric(
             "avg_score": avg_score,
             "avg_weighted_score": avg_weighted,
             "score_distribution": score_dist,
+            **judgment_counts(q_items),
         }
 
     quintile_metrics = {
         "min_words_filter": stats["min_words_filter"],
         "total_items_in_source": stats["total_source_items"],
-        "valid_items_evaluated": len(all_evaluated_items),
+        "valid_items_evaluated": len(global_scores),
+        "judgment_counts": judgment_counts(all_evaluated_items),
         "filtered_ultrashort_items": stats["filtered_ultrashort_items"],
         "macro_avg_valid_score": global_mean_score,
         "macro_avg_valid_weighted_score": global_mean_weighted,
@@ -760,6 +645,7 @@ def evaluate_single_metric(
         "total_items_evaluated": len(global_scores),
         "total_items_in_source": stats["total_source_items"],
         "filtered_ultrashort_items": stats["filtered_ultrashort_items"],
+        "skipped_missing_input_items": stats.get("skipped_missing_input_items", 0),
         "min_review_words_filter": stats["min_words_filter"],
         "quintile_metrics": quintile_metrics,
         "metric_id": metric_id,
@@ -770,6 +656,24 @@ def evaluate_single_metric(
         "source_results": args.results_file,
         "is_shuffled": stats.get("is_shuffled", False),
         "shuffle_info": stats.get("shuffle_info", {}),
+        "judgment_counts": judgment_counts(all_evaluated_items),
+        "protocol_metadata": {
+            "schema_version": 2,
+            "judge_protocol": "alignment_json_v1",
+            "system_prompt_file": args.system_prompt or metric_info["prompt_file"],
+            "instance_prompt_file": args.instance_prompt,
+            "system_prompt": system_prompt,
+            "instance_template": instance_template,
+            "system_prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            "instance_prompt_sha256": hashlib.sha256(instance_template.encode("utf-8")).hexdigest(),
+            "seed": args.seed,
+            "max_tokens": args.max_tokens,
+            "num_ctx": args.num_ctx,
+            "max_retries": args.max_retries,
+            "think": False,
+            "weighted_scoring": "not_computed",
+            "aggregation": "item_mean_over_numeric_scores",
+        },
     }
 
     save_results_json(json_output_path, summary, evaluated_users)
@@ -792,7 +696,7 @@ def evaluate_single_metric(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate LLM explanations with G-Eval Alignment metric on Ollama")
+    parser = argparse.ArgumentParser(description="Evaluate review alignment with JSON reason and nullable score on Ollama")
     parser.add_argument("--model", type=str, default="llama3.1:8b", help="LLM judge model (default: llama3.1:8b)")
     parser.add_argument(
         "--metrics",
@@ -801,6 +705,13 @@ def main():
         default=["alignment"],
         help="Metric to evaluate (default: alignment)",
     )
+    parser.add_argument("--system_prompt", type=str, default=None,
+                        help="Override the system rubric file (default: active metric prompt)")
+    parser.add_argument("--num_ctx", type=int, default=8192,
+                        help="Ollama judge context size (default: 8192)")
+    parser.add_argument("--max_retries", type=int, default=1,
+                        help="Retries for technical failures; valid nulls are not retried")
+    parser.add_argument("--top_logprobs", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--instance_prompt",
         type=str,
@@ -832,8 +743,8 @@ def main():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=150,
-        help="Max tokens to generate for CoT reasoning + score (default: 150)",
+        default=256,
+        help="Max tokens for JSON reason and score (default: 256)",
     )
     parser.add_argument("--ollama_url", type=str, default="http://localhost:11434", help="Ollama URL")
     parser.add_argument(
@@ -843,6 +754,10 @@ def main():
         help="Directory to save JSON and MD output files (default: results_judge/<domain_pair>)",
     )
     args = parser.parse_args()
+    if args.max_tokens < 1 or args.num_ctx < 1 or args.max_retries not in (0, 1):
+        parser.error("max_tokens/num_ctx must be positive; max_retries must be 0 or 1")
+    if args.top_logprobs is not None:
+        print("Note: --top_logprobs is ignored; JSON judge scoring is discrete.")
 
     # Normalizzazione percorsi file rispetto a REPO_ROOT se necessario
     if not os.path.exists(args.results_file):
@@ -888,7 +803,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=================================================================")
-    print("           G-EVAL PIPELINE: ALIGNMENT (TWO-STAGE CoT)            ")
+    print("           REVIEW ALIGNMENT JUDGE (JSON SCORE OR NULL)            ")
     print("=================================================================")
     print(f"Model:                {args.model}")
     print(f"Selected Metrics:     {selected_metrics} ({len(selected_metrics)} in totale)")
@@ -898,11 +813,12 @@ def main():
         f"Total Items:          {stats['total_source_items']} "
         f"(validi: {stats['valid_items_count']}, filtrati ultra-short < {args.min_words}w: {stats['filtered_ultrashort_items']})"
     )
-    print(f"Max Tokens per Item:  {args.max_tokens} (CoT reasoning + score)")
+    print(f"Max Tokens per Item:  {args.max_tokens} (JSON reason + score)")
     print(f"Output Directory:     {args.output_dir}")
     print("=================================================================\n")
 
     saved_reports = []
+    total_successful = 0
     for metric_id in selected_metrics:
         json_path, md_path = evaluate_single_metric(
             metric_id=metric_id,
@@ -913,6 +829,9 @@ def main():
             now_str=now_str,
         )
         saved_reports.append((metric_id, json_path, md_path))
+        with open(json_path, "r", encoding="utf-8") as report_file:
+            counts = json.load(report_file)["judgment_counts"]
+        total_successful += counts["scored_count"] + counts["insufficient_evidence_count"]
 
     print("\n=================================================================")
     print("              TUTTE LE VALUTAZIONI SONO COMPLETATE!              ")
@@ -923,6 +842,9 @@ def main():
         print(f"    JSON: {j_path}")
         print(f"    MD:   {m_path}")
     print("=================================================================")
+
+    if not total_successful:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

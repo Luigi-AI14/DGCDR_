@@ -92,6 +92,10 @@ def parse_args():
         action="store_true",
         help="Skip Phase 1 (generation) and execute only Phase 2 (judge) on latest existing results files.",
     )
+    parser.add_argument("--system_prompt", default=None, help="Judge system rubric override")
+    parser.add_argument("--instance_prompt", default=None, help="Judge instance template override")
+    parser.add_argument("--judge_max_tokens", type=int, default=256)
+    parser.add_argument("--judge_num_ctx", type=int, default=8192)
     parser.add_argument(
         "--skip_judge",
         action="store_true",
@@ -188,7 +192,7 @@ def extract_saved_json_from_logs(logs: List[str]) -> Optional[str]:
 
 
 def extract_judge_outputs_from_logs(logs: List[str]) -> Tuple[Optional[str], Optional[float], Optional[float]]:
-    """Parses test_geval_prompts.py stdout logs for output file and average scores."""
+    """Find the saved report in logs, then read nullable summary values from JSON."""
     json_path = None
     mean_score = None
     weighted_score = None
@@ -201,22 +205,11 @@ def extract_judge_outputs_from_logs(logs: List[str]) -> Tuple[Optional[str], Opt
             if os.path.exists(p):
                 json_path = p
 
-        # Global score
-        m_score = re.search(r"Media Globale Score:\s+([0-9.]+)/5", line)
-        if m_score:
-            try:
-                mean_score = float(m_score.group(1))
-            except ValueError:
-                pass
-
-        # Global weighted score
-        m_weighted = re.search(r"Media Globale Score Pesato:\s+([0-9.]+)/5", line)
-        if m_weighted:
-            try:
-                weighted_score = float(m_weighted.group(1))
-            except ValueError:
-                pass
-
+    if json_path:
+        with open(json_path, "r", encoding="utf-8") as report_file:
+            report = json.load(report_file)
+        mean_score = report.get("global_mean_score")
+        weighted_score = report.get("global_mean_weighted_score")
     return json_path, mean_score, weighted_score
 
 
@@ -339,19 +332,33 @@ def main():
                 "--results_file", target_json,
                 "--output_dir", judge_output_dir,
                 "--ollama_url", args.ollama_url,
+                "--max_tokens", str(args.judge_max_tokens),
+                "--num_ctx", str(args.judge_num_ctx),
             ]
+            if args.system_prompt:
+                cmd_judge.extend(["--system_prompt", args.system_prompt])
+            if args.instance_prompt:
+                cmd_judge.extend(["--instance_prompt", args.instance_prompt])
 
             try:
                 retcode_judge, logs_judge = run_command_streaming(cmd_judge)
+                j_path, m_score, w_score = extract_judge_outputs_from_logs(logs_judge)
+                rec["judge_json_file"] = j_path
                 if retcode_judge == 0:
-                    j_path, m_score, w_score = extract_judge_outputs_from_logs(logs_judge)
+                    if not j_path:
+                        raise RuntimeError("Judge exited without a saved JSON report")
                     rec["judge_status"] = "Completed"
-                    rec["judge_json_file"] = j_path
+                    with open(j_path, "r", encoding="utf-8") as report_file:
+                        counts = json.load(report_file).get("judgment_counts", {})
+                    if counts.get("failed_count", 0):
+                        rec["judge_status"] = "Completed with errors"
+                    elif m_score is None:
+                        rec["judge_status"] = "Completed (unassessable)"
                     rec["judge_score"] = m_score
                     rec["judge_weighted"] = w_score
                     print(f"\n[OK] Valutazione Judge completata per {gen_model}!")
                     if m_score is not None:
-                        print(f"     Alignment Score: {m_score}/5 | Weighted Score: {w_score}/5.0")
+                        print(f"     Alignment Score: {m_score}/5 | Weighted Score: {'N/A' if w_score is None else w_score}")
                 else:
                     # Model might be absent (e.g. qwen3.8:27b on current machine)
                     rec["judge_status"] = f"Failed (exit code {retcode_judge})"

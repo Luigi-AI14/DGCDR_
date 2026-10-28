@@ -525,10 +525,18 @@ def run_judge_evaluation(
 # 5. CONTRASTIVE BENCHMARK & COMPARISON (CONGRUENT VS SHUFFLED)
 # ==============================================================================
 
-def compute_distribution_stats(values: List[float]) -> Dict[str, float]:
+def fmt_delta(value):
+    return f"{value:+.4f}" if value is not None else "N/A"
+
+
+def fmt_value(value):
+    return str(value) if value is not None else "N/A"
+
+
+def compute_distribution_stats(values: List[float]) -> Dict[str, Any]:
     """Computes descriptive stats for a list of values."""
     if not values:
-        return {"count": 0, "mean": 0.0, "std": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
+        return {"count": 0, "mean": None, "std": None, "median": None, "min": None, "max": None}
     arr = np.array(values, dtype=np.float64)
     return {
         "count": int(len(arr)),
@@ -594,6 +602,13 @@ def compare_congruent_vs_shuffled(
     with open(shuffled_path, "r", encoding="utf-8") as f:
         shuf_data = json.load(f)
 
+    # Never silently compare different rubric/protocol conditions.
+    for field in ("judge_protocol", "system_prompt_sha256", "instance_prompt_sha256", "model"):
+        c_value = cong_data.get("metadata", {}).get(field)
+        s_value = shuf_data.get("metadata", {}).get(field)
+        if c_value != s_value:
+            raise ValueError("Incompatible judge reports: different " + field)
+
     # Build lookup table for shuffled items: (user_id, item_id) -> item_data
     shuf_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for u in shuf_data.get("users", []):
@@ -603,12 +618,14 @@ def compare_congruent_vs_shuffled(
             shuf_map[(uid, iid)] = it
 
     matched_pairs = []
+    common_items = 0
     for u in cong_data.get("users", []):
         uid = u["user_id"]
         for it in u.get("items", []):
             iid = it.get("item_id") or it.get("id_item", "")
             key = (uid, iid)
             if key in shuf_map:
+                common_items += 1
                 shuf_it = shuf_map[key]
                 c_score = it.get("score")
                 s_score = shuf_it.get("score")
@@ -633,13 +650,14 @@ def compare_congruent_vs_shuffled(
 
     n_matched = len(matched_pairs)
     logger.info(f"Found {n_matched} matched evaluation pairs between congruent and shuffled runs.")
-    if n_matched == 0:
+    if common_items == 0:
         raise ValueError("No common items found between the two evaluation files.")
 
     c_scores = [p["congruent_score"] for p in matched_pairs]
     s_scores = [p["shuffled_score"] for p in matched_pairs]
-    c_weights = [p["congruent_weighted"] for p in matched_pairs if p["congruent_weighted"] is not None]
-    s_weights = [p["shuffled_weighted"] for p in matched_pairs if p["shuffled_weighted"] is not None]
+    weighted_pairs = [p for p in matched_pairs if p["congruent_weighted"] is not None and p["shuffled_weighted"] is not None]
+    c_weights = [p["congruent_weighted"] for p in weighted_pairs]
+    s_weights = [p["shuffled_weighted"] for p in weighted_pairs]
 
     # Metrics
     stats_c_disc = compute_distribution_stats(c_scores)
@@ -647,22 +665,22 @@ def compare_congruent_vs_shuffled(
     stats_c_wt = compute_distribution_stats(c_weights)
     stats_s_wt = compute_distribution_stats(s_weights)
 
-    margin_disc = round(stats_c_disc["mean"] - stats_s_disc["mean"], 4)
-    margin_wt = round(stats_c_wt["mean"] - stats_s_wt["mean"], 4)
+    margin_disc = round(stats_c_disc["mean"] - stats_s_disc["mean"], 4) if n_matched else None
+    margin_wt = round(stats_c_wt["mean"] - stats_s_wt["mean"], 4) if weighted_pairs else None
 
     wins = sum(1 for c, s in zip(c_scores, s_scores) if c > s)
     ties = sum(1 for c, s in zip(c_scores, s_scores) if c == s)
     losses = sum(1 for c, s in zip(c_scores, s_scores) if c < s)
 
-    win_rate = round(wins / n_matched * 100, 2)
-    tie_rate = round(ties / n_matched * 100, 2)
-    loss_rate = round(losses / n_matched * 100, 2)
+    win_rate = round(wins / n_matched * 100, 2) if n_matched else None
+    tie_rate = round(ties / n_matched * 100, 2) if n_matched else None
+    loss_rate = round(losses / n_matched * 100, 2) if n_matched else None
 
     # Distributions
     dist_c = {s: c_scores.count(s) for s in range(1, 6)}
     dist_s = {s: s_scores.count(s) for s in range(1, 6)}
-    dist_c_pct = {s: round(dist_c[s] / n_matched * 100, 1) for s in range(1, 6)}
-    dist_s_pct = {s: round(dist_s[s] / n_matched * 100, 1) for s in range(1, 6)}
+    dist_c_pct = {s: round(dist_c[s] / n_matched * 100, 1) if n_matched else 0.0 for s in range(1, 6)}
+    dist_s_pct = {s: round(dist_s[s] / n_matched * 100, 1) if n_matched else 0.0 for s in range(1, 6)}
 
     # Hypothesis testing
     tests_disc = compute_statistical_tests(c_scores, s_scores)
@@ -675,8 +693,9 @@ def compare_congruent_vs_shuffled(
         if q_pairs:
             q_c = [p["congruent_score"] for p in q_pairs]
             q_s = [p["shuffled_score"] for p in q_pairs]
-            q_cw = [p["congruent_weighted"] for p in q_pairs if p["congruent_weighted"] is not None]
-            q_sw = [p["shuffled_weighted"] for p in q_pairs if p["shuffled_weighted"] is not None]
+            q_weighted = [p for p in q_pairs if p["congruent_weighted"] is not None and p["shuffled_weighted"] is not None]
+            q_cw = [p["congruent_weighted"] for p in q_weighted]
+            q_sw = [p["shuffled_weighted"] for p in q_weighted]
 
             q_wins = sum(1 for c, s in zip(q_c, q_s) if c > s)
             by_quintile[qid] = {
@@ -698,6 +717,9 @@ def compare_congruent_vs_shuffled(
         "congruent_file": congruent_path,
         "shuffled_file": shuffled_path,
         "matched_items": n_matched,
+        "common_items": common_items,
+        "excluded_non_numeric_pairs": common_items - n_matched,
+        "weighted_matched_items": len(weighted_pairs),
         "margins": {
             "discrete_margin": margin_disc,
             "weighted_margin": margin_wt,
@@ -760,18 +782,21 @@ def compare_congruent_vs_shuffled(
         "# LLM-as-a-Judge Discriminative Benchmark Report\n",
         "## Contrastive Validation (Congruent vs. Shuffled Baseline)\n",
         f"- **Evaluated Pairs**: {n_matched} items",
+        f"- **Common Items**: {common_items}",
+        f"- **Excluded Null/Failed Pairs**: {common_items - n_matched}",
+        f"- **Paired Weighted Judgments**: {len(weighted_pairs)}",
         f"- **Congruent Source**: `{os.path.basename(congruent_path)}`",
         f"- **Shuffled Source**: `{os.path.basename(shuffled_path)}`",
         f"- **Timestamp**: `{datetime.datetime.now().isoformat()}`\n",
         "### 1. Key Discriminative Metrics",
         rf"| Metric | Congruent (Real) | Shuffled (Baseline) | Contrastive Margin ($\Delta$) | Win Rate (Pos > Neg) |",
         f"|:---|:---:|:---:|:---:|:---:|",
-        f"| **Discrete Score (1-5)** | **{stats_c_disc['mean']}** &plusmn; {stats_c_disc['std']} | **{stats_s_disc['mean']}** &plusmn; {stats_s_disc['std']} | **{margin_disc:+.4f}** | **{win_rate}%** |",
-        f"| **Weighted Score (G-Eval)** | **{stats_c_wt['mean']}** &plusmn; {stats_c_wt['std']} | **{stats_s_wt['mean']}** &plusmn; {stats_s_wt['std']} | **{margin_wt:+.4f}** | - |\n",
+        f"| **Discrete Score (1-5)** | **{fmt_value(stats_c_disc['mean'])}** &plusmn; {fmt_value(stats_c_disc['std'])} | **{fmt_value(stats_s_disc['mean'])}** &plusmn; {fmt_value(stats_s_disc['std'])} | **{fmt_delta(margin_disc)}** | **{fmt_value(win_rate)}%** |",
+        f"| **Weighted Score (G-Eval)** | **{fmt_value(stats_c_wt['mean'])}** &plusmn; {fmt_value(stats_c_wt['std'])} | **{fmt_value(stats_s_wt['mean'])}** &plusmn; {fmt_value(stats_s_wt['std'])} | **{fmt_delta(margin_wt)}** | - |\n",
         "### 2. Discrimination Outcome Breakdown",
-        f"- **Discriminative Wins (Congruent > Shuffled)**: **{wins}** ({win_rate}%)",
-        f"- **Ties (Congruent == Shuffled)**: **{ties}** ({tie_rate}%)",
-        f"- **Inversions (Congruent < Shuffled)**: **{losses}** ({loss_rate}%)\n",
+        f"- **Discriminative Wins (Congruent > Shuffled)**: **{wins}** ({fmt_value(win_rate)}%)",
+        f"- **Ties (Congruent == Shuffled)**: **{ties}** ({fmt_value(tie_rate)}%)",
+        f"- **Inversions (Congruent < Shuffled)**: **{losses}** ({fmt_value(loss_rate)}%)\n",
         "### 3. Score Distributions Comparison",
         "| Score Level | Congruent Count (%) | Shuffled Count (%) | Delta % (Cong - Shuf) | Theoretical Expectation |",
         "|:---:|:---:|:---:|:---:|:---|",
@@ -810,10 +835,10 @@ def compare_congruent_vs_shuffled(
     print("      BENCHMARK LLM JUDGE: CONGRUENT vs. SHUFFLED BASELINE       ")
     print("=" * 65)
     print(f"Items Evaluati:             {n_matched}")
-    print(f"Media Congruent:            {stats_c_disc['mean']} / 5  (Weighted: {stats_c_wt['mean']})")
-    print(f"Media Shuffled (Baseline):  {stats_s_disc['mean']} / 5  (Weighted: {stats_s_wt['mean']})")
-    print(f"Margine Contrastivo Delta:  {margin_disc:+.4f}     (Weighted: {margin_wt:+.4f})")
-    print(f"Discriminative Win Rate:    {win_rate}% ({wins}/{n_matched})")
+    print(f"Media Congruent:            {fmt_value(stats_c_disc['mean'])} / 5  (Weighted: {fmt_value(stats_c_wt['mean'])})")
+    print(f"Media Shuffled (Baseline):  {fmt_value(stats_s_disc['mean'])} / 5  (Weighted: {fmt_value(stats_s_wt['mean'])})")
+    print(f"Margine Contrastivo Delta:  {fmt_delta(margin_disc)}     (Weighted: {fmt_delta(margin_wt)})")
+    print(f"Discriminative Win Rate:    {fmt_value(win_rate)}% ({wins}/{n_matched})")
     print(f"T-Test p-value:             {fmt_p(tests_disc.get('t_pvalue'))}")
     print(f"Cohen's d Effect Size:      {tests_disc.get('cohens_d')}")
     print("Distribuzione Punteggi:")

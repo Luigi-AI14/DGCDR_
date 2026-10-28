@@ -1,11 +1,8 @@
-[Item Name]:
-{item_name}
+[Item Title]
+{item_title}
 
-[User Review]:
+[Held-Out User Review]
 {user_review}
 
-[Recommendation Explanation]:
+[Recommendation Explanation]
 {explanation}
-
-Evaluation Form:
-Reasoning:

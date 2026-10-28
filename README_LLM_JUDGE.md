@@ -1,4 +1,30 @@
-# Stato Attuale del Sistema LLM-as-a-Judge (G-Eval Alignment)
+# LLM-as-a-Judge: protocollo JSON corrente
+
+Aggiornamento del 28 ottobre 2026. Il judge mantiene due messaggi separati:
+
+- `llm_explainer/prompts/TEST_PROMPT_ALIGNMENT.txt`: istruzioni, rubric e formato JSON (system).
+- `llm_explainer/prompts/TEST_PROMPT_INSTANCE.txt`: solo titolo prodotto, recensione ed explanation (user).
+
+Il modello restituisce `{"reason": "...", "alignment_score": 4}` oppure un punteggio JSON `null` per evidenza insufficiente. Il parser accetta solo interi 1–5 o null; non ricava voti dalle cifre nella motivazione. Le motivazioni, le risposte originali e gli errori vengono salvati nei report.
+
+Il limite predefinito è 256 token, con `think=False` e contesto configurabile (`--num_ctx`, default 8192). È previsto un solo retry per errori tecnici; in caso di output troncato il budget passa almeno a 512 token. Un null valido non viene ritentato. Le medie usano solo voti numerici, con conteggi separati per `scored`, `insufficient_evidence` e fallimenti. I campi weighted sono conservati come null: questo protocollo non calcola probabilità pesate.
+
+Esecuzione sulle spiegazioni già generate, dalla root del repository:
+
+```bash
+python llm_explainer/judge/test_geval_prompts.py \
+  --model qwen3.8:27b \
+  --results_file results/Cloth-Elec/llama3.1_8b_v2/Cloth-Elec_llama3.1_8b_v2_20261017_111427.json \
+  --num_users 5 --max_tokens 256
+```
+
+I file predefiniti vengono caricati automaticamente. Per cambiarli usare `--system_prompt PERCORSO` e `--instance_prompt PERCORSO`; entrambi devono mantenere il protocollo JSON. `test_geval_fixed.py` richiama ora la stessa implementazione. Nella pipeline usare `--skip_generation` per riutilizzare le spiegazioni e, se necessario, `--judge_max_tokens` / `--judge_num_ctx`. La generazione e il suo prompt non sono stati modificati.
+
+I confronti congruent/shuffled escludono coppie con punteggi null o falliti, ne riportano il numero e rifiutano report con rubric/protocolli diversi. Un confronto senza voti numerici produce metriche null. Report e rubric precedenti vanno conservati come esperimenti distinti.
+
+## Documentazione storica del precedente protocollo G-Eval
+
+Le sezioni seguenti descrivono la versione precedente, con output testuale e logprobs, e non il protocollo JSON corrente.
 
 Questo documento descrive in dettaglio l'architettura, il funzionamento, gli script utilizzati e l'intera cronologia delle migliorie applicate al sistema di valutazione automatica basato su **LLM-as-a-Judge** per il progetto **DGCDR** (*Disentangled Graph Cross-Domain Recommendation*).
 
