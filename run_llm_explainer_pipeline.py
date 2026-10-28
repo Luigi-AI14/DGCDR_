@@ -102,6 +102,11 @@ def parse_args():
         help="Skip Phase 2 (judge) and execute only Phase 1 (generation).",
     )
     parser.add_argument(
+        "--no_few_shot",
+        action="store_true",
+        help="Remove few-shot demonstration examples from the LLM prompt during generation.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Execute mock generation in validation script (dry run).",
@@ -114,6 +119,7 @@ def find_latest_results_file(
     model_name: str,
     base_results_dir: str = "results",
     prompt_version: str = "v2",
+    no_few_shot: bool = False,
 ) -> Optional[str]:
     """
     Finds the most recent validation results JSON file for a given domain pair and model.
@@ -123,6 +129,8 @@ def find_latest_results_file(
     clean_version = sanitize_model_name(prompt_version) if prompt_version else ""
     is_v1 = not clean_version or clean_version.lower() == "v1"
     version_suffix = "" if is_v1 else f"_{clean_version}"
+    if no_few_shot:
+        version_suffix += "_no_few_shot"
     model_folder = f"{clean_model}{version_suffix}"
 
     candidate_dir = os.path.join(REPO_ROOT, base_results_dir, domain_pair, model_folder)
@@ -225,6 +233,7 @@ def main():
     print(f"Number of Users:     {args.num_users}")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"Validation Caches:   Disabled (--no_cache_llm, --no_cache_sbert)")
+    print(f"Few-Shot Examples:   {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"Judge Model:         {args.judge_model}")
     print(f"Skip Generation:     {args.skip_generation}")
     print(f"Skip Judge:          {args.skip_judge}")
@@ -271,6 +280,8 @@ def main():
                 "--sbert_model", args.sbert_model,
                 "--ollama_url", args.ollama_url,
             ]
+            if args.no_few_shot:
+                cmd.append("--no_few_shot")
             if args.dry_run:
                 cmd.append("--dry_run")
 
@@ -279,7 +290,7 @@ def main():
             if retcode == 0:
                 saved_json = extract_saved_json_from_logs(logs)
                 if not saved_json:
-                    saved_json = find_latest_results_file(args.domain_pair, gen_model)
+                    saved_json = find_latest_results_file(args.domain_pair, gen_model, no_few_shot=args.no_few_shot)
                 run_records[gen_model]["gen_status"] = "Completed"
                 run_records[gen_model]["gen_json_file"] = saved_json
                 print(f"\n[OK] Generazione completata con successo per {gen_model}!")
@@ -291,7 +302,7 @@ def main():
     else:
         print("\n>>> FASE 1 SALTATA (--skip_generation). Ricerca dei risultati esistenti...")
         for gen_model in DEFAULT_GENERATOR_MODELS:
-            latest_file = find_latest_results_file(args.domain_pair, gen_model)
+            latest_file = find_latest_results_file(args.domain_pair, gen_model, no_few_shot=args.no_few_shot)
             if latest_file:
                 run_records[gen_model]["gen_status"] = "Pre-existing"
                 run_records[gen_model]["gen_json_file"] = latest_file

@@ -110,6 +110,7 @@ DEFAULT_SETTINGS = {
     "prompts_dir": os.path.join(BASE_DIR, "saved_prompts"),
     "output_dir": os.path.join(BASE_DIR, "results"),
     "prompt_version": "v2",
+    "no_few_shot": False,
     "bertscore_model": "roberta-large",
     "bertscore_batch_size": 16,
     "bertscore_rescale_with_baseline": True,

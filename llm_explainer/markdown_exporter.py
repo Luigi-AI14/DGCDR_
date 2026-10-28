@@ -85,6 +85,8 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     md.append(f"| **LLM Model** | `{model}` |")
     if prompt_version:
         md.append(f"| **Prompt Version** | `{prompt_version}` |")
+    no_few_shot = data.get("no_few_shot", False)
+    md.append(f"| **Few-Shot Demonstrations** | `{'Disabled' if no_few_shot else 'Enabled'}` |")
     md.append(f"| **Sentence-BERT Model** | `{sbert_model}` |")
     rescale_baseline = data.get("bertscore_rescale_with_baseline", True)
     if has_bertscore and bertscore_model:
