@@ -74,6 +74,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from llm_explainer.judge.markdown_report import score_distribution_markdown
+
 DEFAULT_RESULTS_DIR = os.path.join(BASE_DIR, "results")
 DEFAULT_JUDGE_RESULTS_DIR = os.path.join(BASE_DIR, "results_judge")
 
@@ -788,7 +790,18 @@ def compare_congruent_vs_shuffled(
         f"- **Congruent Source**: `{os.path.basename(congruent_path)}`",
         f"- **Shuffled Source**: `{os.path.basename(shuffled_path)}`",
         f"- **Timestamp**: `{datetime.datetime.now().isoformat()}`\n",
-        "### 1. Key Discriminative Metrics",
+    ]
+    md_lines.extend([
+        "### Full-Run Score Distributions\n",
+        "All attempted items in each source run. The runs may contain different numbers of items; "
+        "each Overall row shows its own total. These tables include judgments excluded from paired metrics.\n",
+    ])
+    for name, data in (("Congruent", cong_data), ("Shuffled", shuf_data)):
+        md_lines.append(f"#### {name}: All Attempted Items in the Source Run\n")
+        md_lines.extend(score_distribution_markdown(data))
+
+    md_lines.extend([
+        "### 1. Key Discriminative Metrics\n",
         rf"| Metric | Congruent (Real) | Shuffled (Baseline) | Contrastive Margin ($\Delta$) | Win Rate (Pos > Neg) |",
         f"|:---|:---:|:---:|:---:|:---:|",
         f"| **Discrete Score (1-5)** | **{fmt_value(stats_c_disc['mean'])}** &plusmn; {fmt_value(stats_c_disc['std'])} | **{fmt_value(stats_s_disc['mean'])}** &plusmn; {fmt_value(stats_s_disc['std'])} | **{fmt_delta(margin_disc)}** | **{fmt_value(win_rate)}%** |",
@@ -797,10 +810,11 @@ def compare_congruent_vs_shuffled(
         f"- **Discriminative Wins (Congruent > Shuffled)**: **{wins}** ({fmt_value(win_rate)}%)",
         f"- **Ties (Congruent == Shuffled)**: **{ties}** ({fmt_value(tie_rate)}%)",
         f"- **Inversions (Congruent < Shuffled)**: **{losses}** ({fmt_value(loss_rate)}%)\n",
-        "### 3. Score Distributions Comparison",
+        "### 3. Score Distributions Comparison\n",
+        "Numeric scores in both runs only. Percentages use the number of numeric pairs.\n",
         "| Score Level | Congruent Count (%) | Shuffled Count (%) | Delta % (Cong - Shuf) | Theoretical Expectation |",
         "|:---:|:---:|:---:|:---:|:---|",
-    ]
+    ])
 
     for s in range(1, 6):
         d_pct = round(dist_c_pct[s] - dist_s_pct[s], 1)

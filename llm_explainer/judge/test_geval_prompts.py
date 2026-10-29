@@ -20,6 +20,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts
+from llm_explainer.judge.markdown_report import format_outcome_count, score_distribution_markdown
 
 try:
     from llm_explainer.quintiles import QuintileManager, count_words
@@ -346,20 +347,21 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
     mean_w_str = f"{summary['global_mean_weighted_score']:.4f} / 5.0" if summary["global_mean_weighted_score"] is not None else "N/A"
     min_w = summary.get("min_review_words_filter", 5)
     counts = summary["judgment_counts"]
+    coverage = f"{counts['score_coverage_pct']}%" if counts["score_coverage_pct"] is not None else "N/A"
 
     lines = [
         f"# Review Alignment Evaluation Report: {summary['metric_name']}\n",
-        "## Global Summary",
+        "## Global Summary\n",
         f"- **Metric**: `{summary['metric_name']}` (`{summary['metric_id']}`)",
         f"- **Global Mean Score**: {mean_s_str}",
         f"- **Global Mean Weighted Score**: {mean_w_str}",
         f"- **Attempted Items**: {counts['attempted_count']}",
-        f"- **Insufficient Evidence**: {counts['insufficient_evidence_count']}",
-        f"- **Technical Failures**: {counts['failed_count']}",
-        f"- **Score Coverage**: {counts['score_coverage_pct']}%",
+        f"- **Items with Numeric Scores**: {counts['scored_count']}",
+        f"- **Null Judgments (insufficient evidence)**: {format_outcome_count(counts['insufficient_evidence_count'], counts['attempted_count'])}",
+        f"- **Technical Failures**: {format_outcome_count(counts['failed_count'], counts['attempted_count'])}",
+        f"- **Score Coverage**: {coverage}",
         "- Weighted scores are not computed by this judge protocol.",
         f"- **Total Users Evaluated**: {summary['total_users_evaluated']}",
-        f"- **Total Valid Items Evaluated**: {summary['total_items_evaluated']} (&ge; {min_w} words)",
         f"- **Filtered Ultra-Short Items**: {summary.get('filtered_ultrashort_items', 0)} (< {min_w} words excluded)",
         f"- **Missing Input Items**: {summary.get('skipped_missing_input_items', 0)}",
         f"- **Total Items in Source**: {summary.get('total_items_in_source', summary['total_items_evaluated'])}",
@@ -374,13 +376,16 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         )
 
     lines.append("---\n")
+    lines.append("## Score Distribution by Review Length Quintile\n")
+    lines.extend(score_distribution_markdown(summary))
+    lines.append("---\n")
 
     # Tabella Stratificazione Quintili
     qm = summary.get("quintile_metrics", {})
     by_q = qm.get("by_quintile", {})
     if by_q:
         lines.append(f"## Stratified Metrics by Review Length Quintiles (Min Words &ge; {min_w})\n")
-        lines.append("| Quintile | Label | Word Range | Attempted | % Attempted | Avg Words | Mean Score | Mean Weighted Score | Scored | Insufficient | Failed |")
+        lines.append("| Quintile | Label | Word Range | Attempted | % Attempted | Avg Words | Mean Score | Mean Weighted Score | Scored | Null (insufficient evidence) | Failed |")
         lines.append("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
         for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
@@ -404,8 +409,9 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
                 lines.append("| " + " | ".join(row) + " |")
 
         # Riga di sintesi globale
+        overall_pct = "100.0%" if counts["attempted_count"] else "N/A"
         lines.append(
-            f"| **Overall** | - | - | {counts['attempted_count']} | 100.0% | - | {mean_s_str} | {mean_w_str} | {counts['scored_count']} | {counts['insufficient_evidence_count']} | {counts['failed_count']} |"
+            f"| **Overall** | - | - | {counts['attempted_count']} | {overall_pct} | - | {mean_s_str} | {mean_w_str} | {counts['scored_count']} | {counts['insufficient_evidence_count']} | {counts['failed_count']} |"
         )
         lines.append("")
         filtered_cnt = summary.get("filtered_ultrashort_items", 0)
@@ -425,7 +431,7 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         lines.append(f"- **User Mean Score**: {u_mean_s}")
         lines.append(f"- **User Mean Weighted Score**: {u_mean_w}")
         uc = u["judgment_counts"]
-        lines.append(f"- **Judgments**: {uc['scored_count']} scored, {uc['insufficient_evidence_count']} insufficient, {uc['failed_count']} failed")
+        lines.append(f"- **Judgments**: {uc['scored_count']} scored, {uc['insufficient_evidence_count']} null (insufficient evidence), {uc['failed_count']} failed")
         lines.append(f"- **Items Evaluated**: {u['items_count']}\n")
         lines.append("#### Items:")
 
