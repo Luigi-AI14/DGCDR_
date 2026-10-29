@@ -96,6 +96,9 @@ def parse_args():
     parser.add_argument("--instance_prompt", default=None, help="Judge instance template override")
     parser.add_argument("--judge_max_tokens", type=int, default=256)
     parser.add_argument("--judge_num_ctx", type=int, default=8192)
+    parser.add_argument("--judge_top_logprobs", type=int, default=20)
+    parser.add_argument("--no_weighted_scoring", action="store_true", help="Disable judge token-probability scoring")
+    parser.add_argument("--judge_num_gpu", type=int, default=None, help="Judge GPU layers; 0 requests CPU execution")
     parser.add_argument(
         "--skip_judge",
         action="store_true",
@@ -345,7 +348,12 @@ def main():
                 "--ollama_url", args.ollama_url,
                 "--max_tokens", str(args.judge_max_tokens),
                 "--num_ctx", str(args.judge_num_ctx),
+                "--top_logprobs", str(args.judge_top_logprobs),
             ]
+            if args.no_weighted_scoring:
+                cmd_judge.append("--no_weighted_scoring")
+            if args.judge_num_gpu is not None:
+                cmd_judge.extend(["--num_gpu", str(args.judge_num_gpu)])
             if args.system_prompt:
                 cmd_judge.extend(["--system_prompt", args.system_prompt])
             if args.instance_prompt:

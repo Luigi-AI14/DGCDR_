@@ -502,6 +502,9 @@ def run_judge_evaluation(
     seed: int = 42,
     ollama_url: str = "http://localhost:11434",
     output_dir: str = "results_judge/Cloth-Elec",
+    top_logprobs: int = 20,
+    no_weighted_scoring: bool = False,
+    num_gpu: Optional[int] = None,
 ) -> int:
     """Runs test_geval_prompts.py on the shuffled dataset using the active Python interpreter."""
     cmd = [
@@ -513,7 +516,12 @@ def run_judge_evaluation(
         "--seed", str(seed),
         "--ollama_url", ollama_url,
         "--output_dir", output_dir,
+        "--top_logprobs", str(top_logprobs),
     ]
+    if no_weighted_scoring:
+        cmd.append("--no_weighted_scoring")
+    if num_gpu is not None:
+        cmd.extend(["--num_gpu", str(num_gpu)])
     if num_users is not None:
         cmd.extend(["--num_users", str(num_users)])
 
@@ -605,7 +613,8 @@ def compare_congruent_vs_shuffled(
         shuf_data = json.load(f)
 
     # Never silently compare different rubric/protocol conditions.
-    for field in ("judge_protocol", "system_prompt_sha256", "instance_prompt_sha256", "model"):
+    for field in ("judge_protocol", "system_prompt_sha256", "instance_prompt_sha256", "model",
+                  "weighted_scoring", "top_logprobs"):
         c_value = cong_data.get("metadata", {}).get(field)
         s_value = shuf_data.get("metadata", {}).get(field)
         if c_value != s_value:
@@ -953,6 +962,9 @@ def parse_args():
     )
 
     # Comparison options
+    parser.add_argument("--top_logprobs", type=int, default=20, help="Judge token alternatives (default: 20)")
+    parser.add_argument("--no_weighted_scoring", action="store_true", help="Run the judge without weighted scoring")
+    parser.add_argument("--num_gpu", type=int, default=None, help="Judge GPU layers; 0 requests CPU execution")
     parser.add_argument(
         "--compare",
         action="store_true",
@@ -1056,6 +1068,9 @@ def main():
             temperature=args.temperature,
             seed=args.seed,
             ollama_url=args.ollama_url,
+            top_logprobs=args.top_logprobs,
+            no_weighted_scoring=args.no_weighted_scoring,
+            num_gpu=args.num_gpu,
         )
         if ret != 0:
             logger.error("Valutazione LLM Judge terminata con errori.")

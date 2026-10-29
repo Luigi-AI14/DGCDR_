@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Review-alignment judge: separate system/instance prompts, strict JSON and nullable scores.
 
-The historical G-Eval filenames and weighted fields are retained for compatibility.
-Probability-weighted scoring is not computed by this JSON protocol.
+Numeric grades also receive a float score from the five grade-token probabilities
+when the inference server supplies a complete distribution.
 """
 
 import argparse
@@ -19,7 +19,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts
+from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts, weighted_score_counts
 from llm_explainer.judge.markdown_report import format_outcome_count, score_distribution_markdown
 
 try:
@@ -325,6 +325,7 @@ def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users
             **summary["protocol_metadata"],
         },
         "judgment_counts": summary["judgment_counts"],
+        "weighted_score_counts": summary["weighted_score_counts"],
         "is_shuffled": summary.get("is_shuffled", False),
         "shuffle_info": summary.get("shuffle_info", {}),
         "users": evaluated_users,
@@ -360,7 +361,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         f"- **Null Judgments (insufficient evidence)**: {format_outcome_count(counts['insufficient_evidence_count'], counts['attempted_count'])}",
         f"- **Technical Failures**: {format_outcome_count(counts['failed_count'], counts['attempted_count'])}",
         f"- **Score Coverage**: {coverage}",
-        "- Weighted scores are not computed by this judge protocol.",
+        f"- **Weighted Score Coverage**: {summary['weighted_score_counts']['computed_count']} / {summary['weighted_score_counts']['eligible_count']} numeric judgments",
+        "- Weighted scores normalize returned token probabilities over grades 1-5; unavailable distributions remain N/A.",
         f"- **Total Users Evaluated**: {summary['total_users_evaluated']}",
         f"- **Filtered Ultra-Short Items**: {summary.get('filtered_ultrashort_items', 0)} (< {min_w} words excluded)",
         f"- **Missing Input Items**: {summary.get('skipped_missing_input_items', 0)}",
@@ -385,8 +387,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
     by_q = qm.get("by_quintile", {})
     if by_q:
         lines.append(f"## Stratified Metrics by Review Length Quintiles (Min Words &ge; {min_w})\n")
-        lines.append("| Quintile | Label | Word Range | Attempted | % Attempted | Avg Words | Mean Score | Mean Weighted Score | Scored | Null (insufficient evidence) | Failed |")
-        lines.append("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
+        lines.append("| Quintile | Label | Word Range | Attempted | % Attempted | Avg Words | Mean Score | Mean Weighted Score | Scored | Null (insufficient evidence) | Failed | Weighted Available |")
+        lines.append("|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
         for qid in ["Q1", "Q2", "Q3", "Q4", "Q5"]:
             if qid in by_q:
@@ -405,13 +407,14 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
                     str(q["scored_count"]),
                     str(q["insufficient_evidence_count"]),
                     str(q["failed_count"]),
+                    f"{q['weighted_score_counts']['computed_count']} / {q['weighted_score_counts']['eligible_count']}",
                 ]
                 lines.append("| " + " | ".join(row) + " |")
 
         # Riga di sintesi globale
         overall_pct = "100.0%" if counts["attempted_count"] else "N/A"
         lines.append(
-            f"| **Overall** | - | - | {counts['attempted_count']} | {overall_pct} | - | {mean_s_str} | {mean_w_str} | {counts['scored_count']} | {counts['insufficient_evidence_count']} | {counts['failed_count']} |"
+            f"| **Overall** | - | - | {counts['attempted_count']} | {overall_pct} | - | {mean_s_str} | {mean_w_str} | {counts['scored_count']} | {counts['insufficient_evidence_count']} | {counts['failed_count']} | {summary['weighted_score_counts']['computed_count']} / {summary['weighted_score_counts']['eligible_count']} |"
         )
         lines.append("")
         filtered_cnt = summary.get("filtered_ultrashort_items", 0)
@@ -446,6 +449,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
             if it.get("error"):
                 lines.append(f"- **Error**: {it['error']}")
             lines.append(f"- **Weighted Score**: {w_score}")
+            lines.append(f"- **Weighted Status**: {it['weighted_score_status']}")
+            lines.append(f"- **Weighted Conditioning**: {it.get('weighted_score_conditioning') or 'N/A'}")
             lines.append(f"- **Quintile**: {q_label_str}")
             lines.append(f"- **Item Title**: {it['item_title']}")
             lines.append(f"- **Review**:\n  > {it['review']}")
@@ -473,6 +478,8 @@ def evaluate_single_metric(
     metric_info = METRICS_REGISTRY[metric_id]
     metric_display_name = metric_info["display_name"]
     system_prompt = load_text(args.system_prompt) if args.system_prompt else load_metric_prompt(metric_info)
+    weighted_enabled = not getattr(args, "no_weighted_scoring", False)
+    top_logprobs = getattr(args, "top_logprobs", 20)
 
     is_shuffled_data = stats.get("is_shuffled", False) or any(it.get("is_shuffled") for u in users_data for it in u.get("items", []))
     shuffled_tag = "_shuffled" if is_shuffled_data else ""
@@ -522,6 +529,9 @@ def evaluate_single_metric(
                 max_tokens=args.max_tokens,
                 num_ctx=args.num_ctx,
                 max_retries=args.max_retries,
+                weighted_scoring=weighted_enabled,
+                top_logprobs=top_logprobs,
+                num_gpu=getattr(args, "num_gpu", None),
             )
 
             if eval_result.get("error"):
@@ -533,7 +543,9 @@ def evaluate_single_metric(
 
             print(
                 f"    Item #{it_idx} ({it['item_id']} | {it['quintile']} {it['quintile_label']}) -> "
-                f"Score: {discrete if discrete is not None else 'N/A'} | Status: {eval_result['status']}"
+                f"Score: {discrete if discrete is not None else 'N/A'} | "
+                f"Weighted: {weighted if weighted is not None else 'N/A'} "
+                f"({eval_result['weighted_score_status']}) | Status: {eval_result['status']}"
             )
             if reasoning:
                 print(f"      [Reasoning]: {reasoning}")
@@ -555,6 +567,9 @@ def evaluate_single_metric(
                 "score": discrete,
                 "weighted_score": weighted,
                 "weighted_score_status": eval_result["weighted_score_status"],
+                "score_probabilities": eval_result["score_probabilities"],
+                "score_token_index": eval_result["score_token_index"],
+                "weighted_score_conditioning": eval_result["weighted_score_conditioning"],
                 "reason": reasoning,
                 "status": eval_result["status"],
                 "error": eval_result["error"],
@@ -588,6 +603,7 @@ def evaluate_single_metric(
             "user_mean_weighted_score": u_mean_weighted,
             "items_count": len(user_eval_items),
             "judgment_counts": judgment_counts(user_eval_items),
+            "weighted_score_counts": weighted_score_counts(user_eval_items),
             "items": user_eval_items,
         })
 
@@ -631,6 +647,7 @@ def evaluate_single_metric(
             "avg_weighted_score": avg_weighted,
             "score_distribution": score_dist,
             **judgment_counts(q_items),
+            "weighted_score_counts": weighted_score_counts(q_items),
         }
 
     quintile_metrics = {
@@ -638,6 +655,7 @@ def evaluate_single_metric(
         "total_items_in_source": stats["total_source_items"],
         "valid_items_evaluated": len(global_scores),
         "judgment_counts": judgment_counts(all_evaluated_items),
+        "weighted_score_counts": weighted_score_counts(all_evaluated_items),
         "filtered_ultrashort_items": stats["filtered_ultrashort_items"],
         "macro_avg_valid_score": global_mean_score,
         "macro_avg_valid_weighted_score": global_mean_weighted,
@@ -663,9 +681,10 @@ def evaluate_single_metric(
         "is_shuffled": stats.get("is_shuffled", False),
         "shuffle_info": stats.get("shuffle_info", {}),
         "judgment_counts": judgment_counts(all_evaluated_items),
+        "weighted_score_counts": weighted_score_counts(all_evaluated_items),
         "protocol_metadata": {
-            "schema_version": 2,
-            "judge_protocol": "alignment_json_v1",
+            "schema_version": 3,
+            "judge_protocol": "alignment_json_logprobs_v1" if weighted_enabled else "alignment_json_v1",
             "system_prompt_file": args.system_prompt or metric_info["prompt_file"],
             "instance_prompt_file": args.instance_prompt,
             "system_prompt": system_prompt,
@@ -677,7 +696,10 @@ def evaluate_single_metric(
             "num_ctx": args.num_ctx,
             "max_retries": args.max_retries,
             "think": False,
-            "weighted_scoring": "not_computed",
+            "weighted_scoring": "normalized_grade_token_logprobs" if weighted_enabled else "disabled",
+            "top_logprobs": top_logprobs if weighted_enabled else None,
+            "weighted_conditioning": "actual_output_prefix; per-item order recorded",
+            "num_gpu": getattr(args, "num_gpu", None),
             "aggregation": "item_mean_over_numeric_scores",
         },
     }
@@ -717,7 +739,11 @@ def main():
                         help="Ollama judge context size (default: 8192)")
     parser.add_argument("--max_retries", type=int, default=1,
                         help="Retries for technical failures; valid nulls are not retried")
-    parser.add_argument("--top_logprobs", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--top_logprobs", type=int, default=20,
+                        help="Token alternatives for weighted scoring, 1-20 (default: 20)")
+    parser.add_argument("--no_weighted_scoring", action="store_true", help="Disable token-probability scoring")
+    parser.add_argument("--num_gpu", type=int, default=None,
+                        help="Ollama GPU layers; 0 requests CPU execution (default: server setting)")
     parser.add_argument(
         "--instance_prompt",
         type=str,
@@ -762,8 +788,8 @@ def main():
     args = parser.parse_args()
     if args.max_tokens < 1 or args.num_ctx < 1 or args.max_retries not in (0, 1):
         parser.error("max_tokens/num_ctx must be positive; max_retries must be 0 or 1")
-    if args.top_logprobs is not None:
-        print("Note: --top_logprobs is ignored; JSON judge scoring is discrete.")
+    if not 1 <= args.top_logprobs <= 20 or (args.num_gpu is not None and args.num_gpu < 0):
+        parser.error("top_logprobs must be 1-20; num_gpu must be nonnegative")
 
     # Normalizzazione percorsi file rispetto a REPO_ROOT se necessario
     if not os.path.exists(args.results_file):
