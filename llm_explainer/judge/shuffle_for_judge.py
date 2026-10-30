@@ -75,6 +75,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from llm_explainer.judge.markdown_report import score_distribution_markdown
+from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
 
 DEFAULT_RESULTS_DIR = os.path.join(BASE_DIR, "results")
 DEFAULT_JUDGE_RESULTS_DIR = os.path.join(BASE_DIR, "results_judge")
@@ -505,6 +506,8 @@ def run_judge_evaluation(
     top_logprobs: int = 20,
     no_weighted_scoring: bool = False,
     num_gpu: Optional[int] = None,
+    judge_prompt: str = "zero-shot",
+    system_prompt: Optional[str] = None,
 ) -> int:
     """Runs test_geval_prompts.py on the shuffled dataset using the active Python interpreter."""
     cmd = [
@@ -524,6 +527,10 @@ def run_judge_evaluation(
         cmd.extend(["--num_gpu", str(num_gpu)])
     if num_users is not None:
         cmd.extend(["--num_users", str(num_users)])
+    if system_prompt:
+        cmd.extend(["--system_prompt", system_prompt])
+    else:
+        cmd.extend(["--judge_prompt", judge_prompt])
 
     logger.info("Executing LLM Judge evaluation on shuffled baseline...")
     logger.info(f"Command: {' '.join(cmd)}")
@@ -613,7 +620,7 @@ def compare_congruent_vs_shuffled(
         shuf_data = json.load(f)
 
     # Never silently compare different rubric/protocol conditions.
-    for field in ("judge_protocol", "system_prompt_sha256", "instance_prompt_sha256", "model",
+    for field in ("judge_protocol", "judge_prompt_version", "system_prompt_sha256", "instance_prompt_sha256", "model",
                   "weighted_scoring", "top_logprobs"):
         c_value = cong_data.get("metadata", {}).get(field)
         s_value = shuf_data.get("metadata", {}).get(field)
@@ -725,6 +732,7 @@ def compare_congruent_vs_shuffled(
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     report_dict = {
         "timestamp": datetime.datetime.now().isoformat(),
+        "judge_prompt_version": cong_data.get("metadata", {}).get("judge_prompt_version", "unknown"),
         "congruent_file": congruent_path,
         "shuffled_file": shuffled_path,
         "matched_items": n_matched,
@@ -792,6 +800,7 @@ def compare_congruent_vs_shuffled(
     md_lines = [
         "# LLM-as-a-Judge Discriminative Benchmark Report\n",
         "## Contrastive Validation (Congruent vs. Shuffled Baseline)\n",
+        f"- **Judge Prompt Version**: `{report_dict['judge_prompt_version']}`",
         f"- **Evaluated Pairs**: {n_matched} items",
         f"- **Common Items**: {common_items}",
         f"- **Excluded Null/Failed Pairs**: {common_items - n_matched}",
@@ -930,6 +939,7 @@ def parse_args():
     )
 
     # Judge execution options
+    add_judge_prompt_arguments(parser)
     parser.add_argument(
         "--run_judge",
         action="store_true",
@@ -1039,6 +1049,7 @@ def main():
     if args.run_judge:
         print(f"Utenti da Valutare:  {args.num_users if args.num_users is not None else 'TUTTI'}")
         print(f"Modello Judge:       {args.model}")
+        print(f"Judge Prompt:        {resolve_judge_prompt(args)[1]}")
     print("=================================================================\n")
 
     json_path, info_path, stats = create_shuffled_dataset(
@@ -1071,6 +1082,8 @@ def main():
             top_logprobs=args.top_logprobs,
             no_weighted_scoring=args.no_weighted_scoring,
             num_gpu=args.num_gpu,
+            judge_prompt=args.judge_prompt,
+            system_prompt=args.system_prompt,
         )
         if ret != 0:
             logger.error("Valutazione LLM Judge terminata con errori.")

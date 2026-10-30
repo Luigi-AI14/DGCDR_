@@ -40,6 +40,7 @@ if REPO_ROOT not in sys.path:
 
 from llm_explainer.config import DOMAIN_CONFIGS
 from llm_explainer.markdown_exporter import sanitize_model_name
+from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
 
 # Pre-configured fixed pipeline settings as requested
 DEFAULT_DOMAIN_PAIR = "Cloth-Elec"
@@ -92,7 +93,7 @@ def parse_args():
         action="store_true",
         help="Skip Phase 1 (generation) and execute only Phase 2 (judge) on latest existing results files.",
     )
-    parser.add_argument("--system_prompt", default=None, help="Judge system rubric override")
+    add_judge_prompt_arguments(parser)
     parser.add_argument("--instance_prompt", default=None, help="Judge instance template override")
     parser.add_argument("--judge_max_tokens", type=int, default=256)
     parser.add_argument("--judge_num_ctx", type=int, default=8192)
@@ -238,6 +239,7 @@ def main():
     print(f"Validation Caches:   Disabled (--no_cache_llm, --no_cache_sbert)")
     print(f"Few-Shot Examples:   {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"Judge Model:         {args.judge_model}")
+    print(f"Judge Prompt:        {resolve_judge_prompt(args)[1]}")
     print(f"Skip Generation:     {args.skip_generation}")
     print(f"Skip Judge:          {args.skip_judge}")
     print(f"Dry Run Mode:        {args.dry_run}")
@@ -344,6 +346,7 @@ def main():
                 os.path.join(REPO_ROOT, "llm_explainer", "judge", "test_geval_prompts.py"),
                 "--model", args.judge_model,
                 "--results_file", target_json,
+                "--num_users", str(args.num_users),
                 "--output_dir", judge_output_dir,
                 "--ollama_url", args.ollama_url,
                 "--max_tokens", str(args.judge_max_tokens),
@@ -356,6 +359,8 @@ def main():
                 cmd_judge.extend(["--num_gpu", str(args.judge_num_gpu)])
             if args.system_prompt:
                 cmd_judge.extend(["--system_prompt", args.system_prompt])
+            else:
+                cmd_judge.extend(["--judge_prompt", args.judge_prompt])
             if args.instance_prompt:
                 cmd_judge.extend(["--instance_prompt", args.instance_prompt])
 
@@ -408,6 +413,7 @@ def main():
     print(f"Coppia di Dominio:        {args.domain_pair}")
     print(f"Utenti Valutati per Run:  {args.num_users}")
     print(f"Modello Judge:            {args.judge_model}")
+    print(f"Judge Prompt:             {resolve_judge_prompt(args)[1]}")
     print(f"Modello SBERT:            {args.sbert_model}")
     print(f"Durata Totale Pipeline:   {str(duration).split('.')[0]}")
     print("-" * 115)

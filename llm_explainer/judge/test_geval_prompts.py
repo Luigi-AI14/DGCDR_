@@ -21,6 +21,7 @@ if REPO_ROOT not in sys.path:
 
 from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts, weighted_score_counts
 from llm_explainer.judge.markdown_report import format_outcome_count, score_distribution_markdown
+from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
 
 try:
     from llm_explainer.quintiles import QuintileManager, count_words
@@ -354,6 +355,8 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         f"# Review Alignment Evaluation Report: {summary['metric_name']}\n",
         "## Global Summary\n",
         f"- **Metric**: `{summary['metric_name']}` (`{summary['metric_id']}`)",
+        f"- **Judge Prompt Version**: `{summary['protocol_metadata']['judge_prompt_version']}`",
+        f"- **Judge System Prompt**: `{summary['protocol_metadata']['system_prompt_file']}`",
         f"- **Global Mean Score**: {mean_s_str}",
         f"- **Global Mean Weighted Score**: {mean_w_str}",
         f"- **Attempted Items**: {counts['attempted_count']}",
@@ -477,7 +480,8 @@ def evaluate_single_metric(
     """
     metric_info = METRICS_REGISTRY[metric_id]
     metric_display_name = metric_info["display_name"]
-    system_prompt = load_text(args.system_prompt) if args.system_prompt else load_metric_prompt(metric_info)
+    system_prompt_file, judge_prompt_version = resolve_judge_prompt(args)
+    system_prompt = load_text(system_prompt_file)
     weighted_enabled = not getattr(args, "no_weighted_scoring", False)
     top_logprobs = getattr(args, "top_logprobs", 20)
 
@@ -486,8 +490,9 @@ def evaluate_single_metric(
 
     clean_model_name = args.model.replace(":", "_").replace("/", "_")
     domain_pair = stats.get("domain_pair", "Cloth-Elec")
-    json_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.json"
-    md_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}{shuffled_tag}_{now_str}.md"
+    prompt_tag = judge_prompt_version.replace("-", "_")
+    json_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}_{prompt_tag}{shuffled_tag}_{now_str}.json"
+    md_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}_{prompt_tag}{shuffled_tag}_{now_str}.md"
     json_output_path = os.path.join(args.output_dir, json_filename)
     md_output_path = os.path.join(args.output_dir, md_filename)
 
@@ -495,8 +500,9 @@ def evaluate_single_metric(
     print(f"\n=================================================================")
     print(f"  AVVIO VALUTAZIONE METRICA: {metric_display_name.upper()} ({metric_id})")
     print(f"  Utenti validi: {len(users_data)} | Item validi da valutare: {total_valid_items}")
+    print(f"  Judge prompt: {judge_prompt_version} | {system_prompt_file}")
     print(f"  Item ultra-short filtrati (< {stats['min_words_filter']}w): {stats['filtered_ultrashort_items']}")
-    print("  Output: JSON reason + alignment_score (1-5 or null); reasons saved")
+    print("  Output: JSON reason + alignment_score; reasons saved")
     print(f"  Output JSON: {json_output_path}")
     print(f"  Output MD:   {md_output_path}")
     print(f"=================================================================\n")
@@ -685,7 +691,8 @@ def evaluate_single_metric(
         "protocol_metadata": {
             "schema_version": 3,
             "judge_protocol": "alignment_json_logprobs_v1" if weighted_enabled else "alignment_json_v1",
-            "system_prompt_file": args.system_prompt or metric_info["prompt_file"],
+            "judge_prompt_version": judge_prompt_version,
+            "system_prompt_file": system_prompt_file,
             "instance_prompt_file": args.instance_prompt,
             "system_prompt": system_prompt,
             "instance_template": instance_template,
@@ -724,7 +731,7 @@ def evaluate_single_metric(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate review alignment with JSON reason and nullable score on Ollama")
+    parser = argparse.ArgumentParser(description="Evaluate review alignment with a zero-shot or few-shot judge prompt on Ollama")
     parser.add_argument("--model", type=str, default="llama3.1:8b", help="LLM judge model (default: llama3.1:8b)")
     parser.add_argument(
         "--metrics",
@@ -733,8 +740,7 @@ def main():
         default=["alignment"],
         help="Metric to evaluate (default: alignment)",
     )
-    parser.add_argument("--system_prompt", type=str, default=None,
-                        help="Override the system rubric file (default: active metric prompt)")
+    add_judge_prompt_arguments(parser)
     parser.add_argument("--num_ctx", type=int, default=8192,
                         help="Ollama judge context size (default: 8192)")
     parser.add_argument("--max_retries", type=int, default=1,
@@ -835,7 +841,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=================================================================")
-    print("           REVIEW ALIGNMENT JUDGE (JSON SCORE OR NULL)            ")
+    print("                  REVIEW ALIGNMENT JUDGE (JSON)                  ")
     print("=================================================================")
     print(f"Model:                {args.model}")
     print(f"Selected Metrics:     {selected_metrics} ({len(selected_metrics)} in totale)")
