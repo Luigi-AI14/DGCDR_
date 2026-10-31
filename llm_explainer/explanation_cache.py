@@ -125,8 +125,11 @@ class ExplanationCache:
                 else:
                     if report_cache_version != self.prompt_version:
                         continue
-                if self.prompt_hash and data.get("generation_prompt", {}).get("template_sha256") != self.prompt_hash:
-                    continue
+                if self.prompt_hash:
+                    prompt_info = data.get("generation_prompt", {})
+                    report_hash = prompt_info.get("cache_sha256", prompt_info.get("template_sha256"))
+                    if report_hash != self.prompt_hash:
+                        continue
 
                 users = data.get("users", [])
                 for u in users:

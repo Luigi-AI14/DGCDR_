@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from llm_explainer.prompt_builder import split_generation_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,7 +45,7 @@ class OllamaClient:
             logger.warning(f"Ollama health check failed: {e}")
             return False
 
-    def _call_ollama_api(self, prompt: str) -> str:
+    def _call_ollama_api(self, prompt: str, expected_item: Optional[Dict[str, str]] = None) -> str:
         """Internal helper to send a prompt to Ollama /api/chat and return raw text."""
         url = f"{self.base_url}/api/chat"
         system_instruction = (
@@ -51,11 +53,14 @@ class OllamaClient:
             "You MUST reply strictly with a raw JSON object conforming to the requested schema. "
             "Never output chain-of-thought, reasoning notes, drafts, or markdown fences before or after the JSON."
         )
+        instructions, instance = split_generation_prompt(prompt)
+        if instructions is not None:
+            system_instruction += "\n\n" + instructions
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": instance},
             ],
             "stream": False,
             "think": self.think,
@@ -66,6 +71,19 @@ class OllamaClient:
                 "num_predict": 4096,
             },
         }
+        if instructions is not None and expected_item is not None:
+            # Constrain the transport as well as asking for JSON in prose.
+            # The history must not be continued as a newly invented review.
+            payload["format"] = {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "enum": [str(expected_item["item_id"])]},
+                    "item_title": {"type": "string", "enum": [str(expected_item.get("item_title", ""))]},
+                    "explanation": {"type": "string", "minLength": 1},
+                },
+                "required": ["item_id", "item_title", "explanation"],
+                "additionalProperties": False,
+            }
 
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -80,7 +98,7 @@ class OllamaClient:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 if resp_data.get("done_reason") == "length":
                     logger.warning(
-                        "Ollama response generation was truncated due to context window limit (done_reason='length')!"
+                        "Ollama reached a token limit (done_reason='length'); the response may be incomplete."
                     )
                 message = resp_data.get("message", {})
                 raw_response = message.get("content", "")
@@ -116,9 +134,18 @@ class OllamaClient:
             }
 
         last_error = None
+        strict = split_generation_prompt(prompt)[0] is not None
         for attempt in range(max_retries + 1):
             try:
-                raw_response = self._call_ollama_api(prompt)
+                raw_response = self._call_ollama_api(prompt, expected_item=expected_item)
+                if strict:
+                    parsed = json.loads(raw_response)
+                    if (not isinstance(parsed, dict) or set(parsed) != {"item_id", "item_title", "explanation"}
+                            or any(not isinstance(value, str) for value in parsed.values())
+                            or not parsed["explanation"].strip()
+                            or parsed["item_id"] != item_id or parsed["item_title"] != item_title):
+                        raise ValueError("V3 response does not match the requested item/explanation schema")
+                    return parsed
                 explanations = self._parse_json_response(raw_response, expected_item=expected_item)
                 if explanations:
                     return explanations[0]

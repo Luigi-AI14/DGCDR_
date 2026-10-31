@@ -14,6 +14,15 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_PROMPT_VERSION = "v3"
 GENERATION_PROMPT_VERSIONS = ("v2", "v3")
 V3_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3.txt")
+V3_REQUEST_PROTOCOL = "system_instance_json_schema_v1"
+
+
+def split_generation_prompt(prompt: str) -> Tuple[Optional[str], str]:
+    """Separate v3 instructions from data without editing either section."""
+    instructions, separator, instance = prompt.partition("\nINPUT\n")
+    if prompt.startswith("TASK\n") and separator:
+        return instructions, "INPUT\n" + instance
+    return None, prompt
 
 
 def load_generation_template(prompt_version: str) -> Tuple[Optional[str], Optional[str]]:
@@ -28,21 +37,37 @@ def load_generation_template(prompt_version: str) -> Tuple[Optional[str], Option
 
 def generation_prompt_metadata(prompt_version: str) -> Dict[str, Any]:
     template, path = load_generation_template(prompt_version)
+    template_hash = hashlib.sha256(template.encode("utf-8")).hexdigest() if template is not None else None
     return {
         "version": prompt_version,
         "template_file": path,
-        "template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest() if template is not None else None,
+        "template_sha256": template_hash,
+        "history_format": "labeled_text",
+        "request_protocol": V3_REQUEST_PROTOCOL if template_hash else "legacy",
+        # Keep the template hash faithful to its wording while invalidating
+        # explanations generated with the previous JSON history rendering.
+        "cache_sha256": hashlib.sha256((template_hash + ":labeled_text_v1:" + V3_REQUEST_PROTOCOL).encode("utf-8")).hexdigest() if template_hash else None,
     }
 
 
 def _render_v3_history(history: List[Dict]) -> str:
-    # Whitelist history fields; unrelated metadata never enters the prompt.
-    return json.dumps([
-        {key: item.get(key, default) for key, default in (
-            ("item_id", ""), ("item_title", "Unknown Title"), ("rating", None),
-            ("review_title", ""), ("review_text", ""))}
-        for item in history
-    ], ensure_ascii=False, indent=2)
+    # Use the legacy labeled-text layout without copying its instructions
+    # or examples into v3. Only historical evidence fields are included.
+    if not history:
+        return "No historical reviews recorded in this domain."
+    lines = []
+    for idx, item in enumerate(history, 1):
+        rating = item.get("rating")
+        rating_text = f"{float(rating):.1f} / 5.0" if rating is not None else "Unknown"
+        lines.extend([
+            f"{idx}. Item ID: {item.get('item_id', '')}",
+            f"   Item Title: {item.get('item_title', 'Unknown Title')}",
+            f"   User Rating: {rating_text}",
+            f"   Review Title: {(item.get('review_title') or '').strip() or 'No review title'}",
+            f"   Review Text: {(item.get('review_text') or '').strip() or 'No review text'}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
 
 
 def _save_prompt(prompt_text: str, prompts_dir: Optional[str], user_id: str, item_id: str) -> Optional[str]:

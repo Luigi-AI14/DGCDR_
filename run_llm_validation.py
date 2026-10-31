@@ -308,7 +308,7 @@ def main():
         domain_pair=args.domain_pair,
         model_name=args.model,
         prompt_version=cache_prompt_ver,
-        prompt_hash=prompt_metadata["template_sha256"],
+        prompt_hash=prompt_metadata["cache_sha256"],
     )
     if not args.no_cache_llm:
         logger.info(
@@ -462,7 +462,7 @@ def main():
                 })
                 logger.info(
                     f"    Item #{it_idx}/{total_user_items} ({iid}) -> "
-                    f"Generated ({len(item_explanation)} chars)"
+                    f"{'Generated' if item_explanation else 'Failed'} ({len(item_explanation)} chars)"
                 )
 
             if not args.dry_run and not args.no_cache_llm:
