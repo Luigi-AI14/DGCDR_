@@ -109,7 +109,7 @@ DEFAULT_SETTINGS = {
     "ollama_url": "http://localhost:11434",
     "prompts_dir": os.path.join(BASE_DIR, "saved_prompts"),
     "output_dir": os.path.join(BASE_DIR, "results"),
-    "prompt_version": "v2",
+    "prompt_version": "v3",
     "no_few_shot": False,
     "bertscore_model": "roberta-large",
     "bertscore_batch_size": 16,

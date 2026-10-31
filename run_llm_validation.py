@@ -5,7 +5,7 @@ Pipeline steps:
 1. Filter dataset keeping rating >= 4.0 and non-empty reviews (check_review_null.py criteria).
 2. Extract user history (100% source, 80% target) enriched with item titles, review titles and texts.
 3. Extract target held-out items (remaining 20% target test set).
-4. Compose personalized English prompt per user, save to file (saved_prompts/prompt_<user_id>.txt).
+4. Compose a personalized English prompt per user/item using v3 (or legacy v2), and save it.
 5. Generate explanations using Qwen 3.5 9B via Ollama.
 6. Compute syntactic metrics (BLEU, ROUGE-1, ROUGE-2, ROUGE-L) comparing explanation vs actual user review.
 7. Compute user-level and global average metrics.
@@ -14,15 +14,13 @@ Pipeline steps:
 
 import argparse
 import datetime
+import hashlib
 import json
 import logging
 import os
 import sys
 
-from recbole.utils import init_seed
-
 from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
-from llm_explainer.data_extractor import DataExtractor
 from llm_explainer.explanation_cache import ExplanationCache
 from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
 from llm_explainer.metrics import (
@@ -36,8 +34,10 @@ from llm_explainer.metrics import (
     validate_and_resolve_sbert_model,
 )
 from llm_explainer.ollama_client import OllamaClient
-from llm_explainer.prompt_builder import build_item_prompt, build_user_prompt
-from llm_explainer.quintiles import QuintileManager
+from llm_explainer.prompt_builder import (
+    DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS, build_item_prompt,
+    generation_prompt_metadata,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,14 +98,15 @@ def parse_args():
         "--prompt_version",
         "-pv",
         type=str,
-        default=DEFAULT_SETTINGS.get("prompt_version", "v2"),
-        help="Prompt version identifier (default: v2).",
+        default=DEFAULT_SETTINGS.get("prompt_version", DEFAULT_PROMPT_VERSION),
+        choices=GENERATION_PROMPT_VERSIONS,
+        help="Generation template: v3 (default, no examples) or legacy v2.",
     )
     parser.add_argument(
         "--no_few_shot",
         action="store_true",
         default=DEFAULT_SETTINGS.get("no_few_shot", False),
-        help="Remove few-shot demonstration examples from the LLM prompt (default: few-shots included).",
+        help="Remove the legacy v2 style examples. V3 always uses no demonstrations.",
     )
     parser.add_argument(
         "--ollama_url",
@@ -211,12 +212,21 @@ def parse_args():
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.prompt_version == "v3":
+        args.no_few_shot = True
+    return args
 
 
 
 def main():
     args = parse_args()
+    prompt_metadata = generation_prompt_metadata(args.prompt_version)
+    # Keep CLI help/template selection usable without loading the ML stack.
+    from recbole.utils import init_seed
+    from llm_explainer.data_extractor import DataExtractor
+    from llm_explainer.quintiles import QuintileManager
+
     init_seed(args.seed, reproducibility=True)
 
     # 0. Early Validation: Check that the Sentence-BERT model exists and resolves BEFORE running any heavy tasks or Ollama
@@ -298,6 +308,7 @@ def main():
         domain_pair=args.domain_pair,
         model_name=args.model,
         prompt_version=cache_prompt_ver,
+        prompt_hash=prompt_metadata["template_sha256"],
     )
     if not args.no_cache_llm:
         logger.info(
@@ -350,6 +361,12 @@ def main():
     run_prompts_dir = os.path.join(args.prompts_dir, f"prompt_{output_basename}")
     os.makedirs(run_prompts_dir, exist_ok=True)
     logger.info(f"Prompts for this run will be saved in: {run_prompts_dir}")
+    if prompt_metadata["template_file"]:
+        # Archive the exact template as well as the per-item rendered user prompts.
+        with open(prompt_metadata["template_file"], "r", encoding="utf-8") as source:
+            template_text = source.read()
+        with open(os.path.join(run_prompts_dir, "generation_template.txt"), "w", encoding="utf-8") as snapshot:
+            snapshot.write(template_text)
 
     all_user_results = []
     global_bleu_scores = []
@@ -499,6 +516,8 @@ def main():
             global_r2_scores.append(metrics["rouge2_f1"])
             global_rl_scores.append(metrics["rougeL_f1"])
 
+            with open(item_prompt_file, encoding="utf-8") as prompt_handle:
+                item_prompt_hash = hashlib.sha256(prompt_handle.read().encode("utf-8")).hexdigest()
             item_record = {
                 "id_item": iid,
                 "item_title": title,
@@ -511,6 +530,8 @@ def main():
                 "llm_explanation": explanation,
                 "metrics": metrics,
                 "prompt_file": item_prompt_file,
+                "prompt_sha256": item_prompt_hash,
+                "explanation_source": "cache" if cached_expls is not None else ("mock" if args.dry_run else "generated"),
             }
             user_items_evaluated.append(item_record)
             all_evaluated_items.append(item_record)
@@ -781,6 +802,7 @@ def main():
         "model": args.model,
         "prompt_version": args.prompt_version,
         "no_few_shot": args.no_few_shot,
+        "generation_prompt": prompt_metadata,
         "sbert_model": args.sbert_model,
         "bertscore_model": args.bertscore_model if not args.no_bertscore else None,
         "bertscore_rescale_with_baseline": args.bertscore_rescale_baseline if not args.no_bertscore else None,

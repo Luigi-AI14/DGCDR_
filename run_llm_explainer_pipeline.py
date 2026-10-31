@@ -39,6 +39,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from llm_explainer.config import DOMAIN_CONFIGS
+from llm_explainer.prompt_builder import DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS
 from llm_explainer.markdown_exporter import sanitize_model_name
 from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
 
@@ -106,29 +107,39 @@ def parse_args():
         help="Skip Phase 2 (judge) and execute only Phase 1 (generation).",
     )
     parser.add_argument(
+        "--prompt_version", "-pv", choices=GENERATION_PROMPT_VERSIONS,
+        default=DEFAULT_PROMPT_VERSION,
+        help="Generation template: v3 (default, no examples) or legacy v2.",
+    )
+    parser.add_argument(
         "--no_few_shot",
         action="store_true",
-        help="Remove few-shot demonstration examples from the LLM prompt during generation.",
+        help="Remove legacy v2 style examples. V3 always uses no demonstrations.",
     )
     parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Execute mock generation in validation script (dry run).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.prompt_version == "v3":
+        args.no_few_shot = True
+    return args
 
 
 def find_latest_results_file(
     domain_pair: str,
     model_name: str,
     base_results_dir: str = "results",
-    prompt_version: str = "v2",
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
     no_few_shot: bool = False,
 ) -> Optional[str]:
     """
     Finds the most recent validation results JSON file for a given domain pair and model.
     Checks inside results/<domain_pair>/<model_folder>/ first, with fallback to results/<domain_pair>/.
     """
+    if prompt_version == "v3":
+        no_few_shot = True
     clean_model = sanitize_model_name(model_name)
     clean_version = sanitize_model_name(prompt_version) if prompt_version else ""
     is_v1 = not clean_version or clean_version.lower() == "v1"
@@ -155,7 +166,20 @@ def find_latest_results_file(
 
     # Sort descending by modification time
     all_files.sort(key=os.path.getmtime, reverse=True)
-    return all_files[0]
+    for path in all_files:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                report = json.load(handle)
+            if report.get("model") != model_name or report.get("domain_pair") != domain_pair:
+                continue
+            if report.get("prompt_version") != prompt_version:
+                continue
+            if bool(report.get("no_few_shot", False)) != no_few_shot:
+                continue
+        except (OSError, ValueError, AttributeError):
+            continue
+        return path
+    return None
 
 
 def run_command_streaming(cmd: List[str], cwd: str = REPO_ROOT) -> Tuple[int, List[str]]:
@@ -234,6 +258,7 @@ def main():
     print("=" * 90)
     print(f"Domain Pair:         {args.domain_pair}")
     print(f"Generator Models:    {', '.join(DEFAULT_GENERATOR_MODELS)} ({len(DEFAULT_GENERATOR_MODELS)} models)")
+    print(f"Generation Prompt:   {args.prompt_version}")
     print(f"Number of Users:     {args.num_users}")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"Validation Caches:   Disabled (--no_cache_llm, --no_cache_sbert)")
@@ -279,6 +304,7 @@ def main():
                 os.path.join(REPO_ROOT, "run_llm_validation.py"),
                 "--domain_pair", args.domain_pair,
                 "--model", gen_model,
+                "--prompt_version", args.prompt_version,
                 "--num_users", str(args.num_users),
                 "--no_cache_llm",
                 "--no_cache_sbert",
@@ -295,7 +321,7 @@ def main():
             if retcode == 0:
                 saved_json = extract_saved_json_from_logs(logs)
                 if not saved_json:
-                    saved_json = find_latest_results_file(args.domain_pair, gen_model, no_few_shot=args.no_few_shot)
+                    saved_json = find_latest_results_file(args.domain_pair, gen_model, prompt_version=args.prompt_version, no_few_shot=args.no_few_shot)
                 run_records[gen_model]["gen_status"] = "Completed"
                 run_records[gen_model]["gen_json_file"] = saved_json
                 print(f"\n[OK] Generazione completata con successo per {gen_model}!")
@@ -307,7 +333,7 @@ def main():
     else:
         print("\n>>> FASE 1 SALTATA (--skip_generation). Ricerca dei risultati esistenti...")
         for gen_model in DEFAULT_GENERATOR_MODELS:
-            latest_file = find_latest_results_file(args.domain_pair, gen_model, no_few_shot=args.no_few_shot)
+            latest_file = find_latest_results_file(args.domain_pair, gen_model, prompt_version=args.prompt_version, no_few_shot=args.no_few_shot)
             if latest_file:
                 run_records[gen_model]["gen_status"] = "Pre-existing"
                 run_records[gen_model]["gen_json_file"] = latest_file

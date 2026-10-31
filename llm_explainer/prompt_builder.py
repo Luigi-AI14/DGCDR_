@@ -4,9 +4,57 @@ Formats user history across domains, presents a single recommended item from DGC
 enforces JSON response schema, and saves each prompt to a dedicated file.
 """
 
+import hashlib
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
+
+
+DEFAULT_PROMPT_VERSION = "v3"
+GENERATION_PROMPT_VERSIONS = ("v2", "v3")
+V3_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3.txt")
+
+
+def load_generation_template(prompt_version: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve an actual template version rather than just labeling outputs."""
+    if prompt_version not in GENERATION_PROMPT_VERSIONS:
+        raise ValueError("Unsupported generation prompt version: %s" % prompt_version)
+    if prompt_version == "v2":
+        return None, None
+    with open(V3_TEMPLATE_FILE, "r", encoding="utf-8") as handle:
+        return handle.read(), V3_TEMPLATE_FILE
+
+
+def generation_prompt_metadata(prompt_version: str) -> Dict[str, Any]:
+    template, path = load_generation_template(prompt_version)
+    return {
+        "version": prompt_version,
+        "template_file": path,
+        "template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest() if template is not None else None,
+    }
+
+
+def _render_v3_history(history: List[Dict]) -> str:
+    # Whitelist history fields; unrelated metadata never enters the prompt.
+    return json.dumps([
+        {key: item.get(key, default) for key, default in (
+            ("item_id", ""), ("item_title", "Unknown Title"), ("rating", None),
+            ("review_title", ""), ("review_text", ""))}
+        for item in history
+    ], ensure_ascii=False, indent=2)
+
+
+def _save_prompt(prompt_text: str, prompts_dir: Optional[str], user_id: str, item_id: str) -> Optional[str]:
+    if not prompts_dir:
+        return None
+    os.makedirs(prompts_dir, exist_ok=True)
+    safe_uid = "".join(c for c in str(user_id) if c.isalnum() or c in ("-", "_"))
+    safe_iid = "".join(c for c in str(item_id) if c.isalnum() or c in ("-", "_"))
+    path = os.path.join(prompts_dir, f"prompt_{safe_uid}_{safe_iid}.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(prompt_text)
+    return path
 
 
 TARGET_DOMAIN_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -96,17 +144,36 @@ def build_item_prompt(
     target_history: List[Dict],
     target_item: Dict,
     prompts_dir: Optional[str] = None,
-    prompt_version: str = "v2",
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
     include_few_shots: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """
-    Builds a personalized prompt in English for a single recommended item,
-    tailored to the target domain using pragmatic real-world instructions.
+    Builds a single-item prompt using v3 (file template) or legacy v2.
+    V3 preserves the template wording and never appends legacy examples.
     Saves the prompt text to prompts_dir/prompt_<user_id>_<item_id>.txt if prompts_dir is provided.
 
     Returns:
         (prompt_text, saved_file_path)
     """
+    template, _ = load_generation_template(prompt_version)
+    if template is not None:
+        values = {
+            "user_id": str(user_id), "source_domain_name": source_domain_name,
+            "target_domain_name": target_domain_name,
+            "source_history": _render_v3_history(source_history),
+            "target_history": _render_v3_history(target_history),
+            "item_id": str(target_item["item_id"]),
+            "item_title": target_item.get("item_title", "Unknown Title"),
+        }
+        # Replace named input slots only: preserve literal JSON braces and never
+        # interpret braces/placeholders contained in the supplied input data.
+        slots = set(re.findall(r"\{([a-z_]+)\}", template))
+        unknown = slots - values.keys()
+        if unknown:
+            raise ValueError("Unknown v3 prompt placeholders: %s" % ", ".join(sorted(unknown)))
+        prompt_text = re.sub(r"\{([a-z_]+)\}", lambda match: values[match.group(1)], template)
+        return prompt_text, _save_prompt(prompt_text, prompts_dir, user_id, target_item["item_id"])
+
     domain_key = resolve_target_domain_key(target_domain_name)
     domain_profile = TARGET_DOMAIN_PROFILES.get(domain_key, DEFAULT_DOMAIN_PROFILE)
 
@@ -265,7 +332,7 @@ def build_user_prompt(
     target_history: List[Dict],
     recommended_items: List[Dict],
     prompts_dir: Optional[str] = None,
-    prompt_version: str = "v2",
+    prompt_version: str = DEFAULT_PROMPT_VERSION,
     include_few_shots: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """

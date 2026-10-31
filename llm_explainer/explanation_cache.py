@@ -27,14 +27,16 @@ class ExplanationCache:
         self,
         domain_pair: str,
         model_name: str,
-        prompt_version: str = "v2",
+        prompt_version: str = "v3",
         cache_dir: Optional[str] = None,
         results_dir: Optional[str] = None,
+        prompt_hash: Optional[str] = None,
     ):
         self.domain_pair = domain_pair
         self.model_name = model_name
         self.clean_model = sanitize_model_name(model_name)
         self.prompt_version = (prompt_version or "").strip()
+        self.prompt_hash = prompt_hash
         self.clean_version = sanitize_model_name(self.prompt_version) if self.prompt_version else ""
         self.is_v1 = not self.clean_version or self.clean_version.lower() == "v1"
         self.cache_dir = cache_dir or os.path.join(BASE_DIR, "cache", "explanations")
@@ -49,6 +51,9 @@ class ExplanationCache:
             self.cache_file = os.path.join(
                 self.cache_dir, f"expl_{self.domain_pair}_{self.clean_model}.pkl"
             )
+        if self.prompt_hash:
+            # Template edits under the same version must not reuse older text.
+            self.cache_file = self.cache_file[:-4] + "_" + self.prompt_hash + ".pkl"
         # Internal store: user_id -> {item_id: explanation_string}
         self._cache: Dict[str, Dict[str, str]] = {}
         self._dirty = False
@@ -109,14 +114,19 @@ class ExplanationCache:
                 if data.get("temperature") != 0.0:
                     continue
 
-                # Verify matching prompt_version
+                # Reports store version and the demonstration switch separately.
                 file_ver = data.get("prompt_version")
+                report_cache_version = file_ver or ""
+                if data.get("no_few_shot", False):
+                    report_cache_version += "_no_few_shot"
                 if self.is_v1:
                     if file_ver not in (None, "", "v1"):
                         continue
                 else:
-                    if file_ver != self.prompt_version:
+                    if report_cache_version != self.prompt_version:
                         continue
+                if self.prompt_hash and data.get("generation_prompt", {}).get("template_sha256") != self.prompt_hash:
+                    continue
 
                 users = data.get("users", [])
                 for u in users:
