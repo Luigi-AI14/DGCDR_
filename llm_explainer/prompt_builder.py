@@ -14,7 +14,42 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_PROMPT_VERSION = "v3"
 GENERATION_PROMPT_VERSIONS = ("v2", "v3")
 V3_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3.txt")
+V3_FEW_SHOT_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3_FEW_SHOT.txt")
+GENERATION_MODES = ("zero-shot", "few-shot")
 V3_REQUEST_PROTOCOL = "system_instance_json_schema_v1"
+
+
+def resolve_generation_mode(prompt_version, generation_mode=None, no_few_shot=False):
+    """Preserve legacy defaults: v3 zero-shot, v2 few-shot."""
+    mode = generation_mode or ("zero-shot" if no_few_shot or prompt_version == "v3" else "few-shot")
+    if mode not in GENERATION_MODES:
+        raise ValueError("Unsupported generation mode: %s" % mode)
+    return mode
+
+
+def add_generation_mode_arguments(parser, no_few_shot_default=False):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--generation_mode", choices=GENERATION_MODES, default=None,
+        help="Explanation generation examples: zero-shot or few-shot (default: zero-shot for v3, few-shot for v2). Independent of --judge_prompt.",
+    )
+    group.add_argument(
+        "--no_few_shot", action="store_true", default=no_few_shot_default,
+        help="Compatibility alias for --generation_mode zero-shot.",
+    )
+
+
+def normalize_generation_arguments(args):
+    args.generation_mode = resolve_generation_mode(args.prompt_version, args.generation_mode, args.no_few_shot)
+    args.no_few_shot = args.generation_mode == "zero-shot"
+    return args
+
+
+def generation_run_version(prompt_version, generation_mode):
+    """Separate few-shot v3 artifacts while keeping previous run paths valid."""
+    if generation_mode == "zero-shot":
+        return prompt_version + "_no_few_shot"
+    return prompt_version + "_few_shot" if prompt_version == "v3" else prompt_version
 
 
 def split_generation_prompt(prompt: str) -> Tuple[Optional[str], str]:
@@ -25,21 +60,26 @@ def split_generation_prompt(prompt: str) -> Tuple[Optional[str], str]:
     return None, prompt
 
 
-def load_generation_template(prompt_version: str) -> Tuple[Optional[str], Optional[str]]:
+def load_generation_template(prompt_version: str, generation_mode: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """Resolve an actual template version rather than just labeling outputs."""
     if prompt_version not in GENERATION_PROMPT_VERSIONS:
         raise ValueError("Unsupported generation prompt version: %s" % prompt_version)
     if prompt_version == "v2":
         return None, None
-    with open(V3_TEMPLATE_FILE, "r", encoding="utf-8") as handle:
-        return handle.read(), V3_TEMPLATE_FILE
+    mode = resolve_generation_mode(prompt_version, generation_mode)
+    path = V3_FEW_SHOT_TEMPLATE_FILE if mode == "few-shot" else V3_TEMPLATE_FILE
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read(), path
 
 
-def generation_prompt_metadata(prompt_version: str) -> Dict[str, Any]:
-    template, path = load_generation_template(prompt_version)
+def generation_prompt_metadata(prompt_version: str, generation_mode: Optional[str] = None) -> Dict[str, Any]:
+    mode = resolve_generation_mode(prompt_version, generation_mode)
+    template, path = load_generation_template(prompt_version, mode)
     template_hash = hashlib.sha256(template.encode("utf-8")).hexdigest() if template is not None else None
     return {
         "version": prompt_version,
+        "generation_mode": mode,
+        "demonstration_set": "v3_evidence_v1" if prompt_version == "v3" and mode == "few-shot" else ("v2_style" if mode == "few-shot" else None),
         "template_file": path,
         "template_sha256": template_hash,
         "history_format": "labeled_text",
@@ -170,17 +210,22 @@ def build_item_prompt(
     target_item: Dict,
     prompts_dir: Optional[str] = None,
     prompt_version: str = DEFAULT_PROMPT_VERSION,
-    include_few_shots: bool = True,
+    include_few_shots: Optional[bool] = None,
+    generation_mode: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """
     Builds a single-item prompt using v3 (file template) or legacy v2.
-    V3 preserves the template wording and never appends legacy examples.
+    V3 selects a separate evidence-demonstration template for few-shot generation.
     Saves the prompt text to prompts_dir/prompt_<user_id>_<item_id>.txt if prompts_dir is provided.
 
     Returns:
         (prompt_text, saved_file_path)
     """
-    template, _ = load_generation_template(prompt_version)
+    if generation_mode is None and include_few_shots is not None:
+        generation_mode = "few-shot" if include_few_shots else "zero-shot"
+    mode = resolve_generation_mode(prompt_version, generation_mode)
+    include_few_shots = mode == "few-shot"
+    template, _ = load_generation_template(prompt_version, mode)
     if template is not None:
         values = {
             "user_id": str(user_id), "source_domain_name": source_domain_name,
@@ -358,7 +403,8 @@ def build_user_prompt(
     recommended_items: List[Dict],
     prompts_dir: Optional[str] = None,
     prompt_version: str = DEFAULT_PROMPT_VERSION,
-    include_few_shots: bool = True,
+    include_few_shots: Optional[bool] = None,
+    generation_mode: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """
     Backward-compatibility wrapper for build_item_prompt.
@@ -375,5 +421,6 @@ def build_user_prompt(
             prompts_dir=prompts_dir,
             prompt_version=prompt_version,
             include_few_shots=include_few_shots,
+            generation_mode=generation_mode,
         )
     return "", None

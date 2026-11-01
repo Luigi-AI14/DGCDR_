@@ -36,7 +36,8 @@ from llm_explainer.metrics import (
 from llm_explainer.ollama_client import OllamaClient
 from llm_explainer.prompt_builder import (
     DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS, build_item_prompt,
-    generation_prompt_metadata,
+    generation_prompt_metadata, add_generation_mode_arguments,
+    normalize_generation_arguments, generation_run_version,
 )
 
 logging.basicConfig(
@@ -100,14 +101,9 @@ def parse_args():
         type=str,
         default=DEFAULT_SETTINGS.get("prompt_version", DEFAULT_PROMPT_VERSION),
         choices=GENERATION_PROMPT_VERSIONS,
-        help="Generation template: v3 (default, no examples) or legacy v2.",
+        help="Generation template: v3 (default) or legacy v2; examples selected by --generation_mode.",
     )
-    parser.add_argument(
-        "--no_few_shot",
-        action="store_true",
-        default=DEFAULT_SETTINGS.get("no_few_shot", False),
-        help="Remove the legacy v2 style examples. V3 always uses no demonstrations.",
-    )
+    add_generation_mode_arguments(parser, DEFAULT_SETTINGS.get("no_few_shot", False))
     parser.add_argument(
         "--ollama_url",
         type=str,
@@ -212,16 +208,13 @@ def parse_args():
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
     )
-    args = parser.parse_args()
-    if args.prompt_version == "v3":
-        args.no_few_shot = True
-    return args
+    return normalize_generation_arguments(parser.parse_args())
 
 
 
 def main():
     args = parse_args()
-    prompt_metadata = generation_prompt_metadata(args.prompt_version)
+    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode)
     # Keep CLI help/template selection usable without loading the ML stack.
     from recbole.utils import init_seed
     from llm_explainer.data_extractor import DataExtractor
@@ -256,6 +249,9 @@ def main():
     print(f"Held-out Min Words:  >= {args.min_review_words} words (including title)")
     print(f"Sampling Strategy:   Uniform random distribution (seed={args.seed})")
     print(f"Prompt Version:      {args.prompt_version}")
+    print(f"Generation Mode:     {args.generation_mode}")
+    print(f"Generation Template: {prompt_metadata['template_file'] or 'legacy v2 builder'}")
+    print(f"Template SHA-256:    {prompt_metadata['template_sha256'] or 'N/A'}")
     print(f"Few-Shot Examples:   {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"LLM Model:           {args.model} ({'DRY RUN / MOCK' if args.dry_run else 'Ollama Local API'})")
     print(f"Sentence-BERT Model: {args.sbert_model}")
@@ -303,7 +299,7 @@ def main():
     )
 
     # 2.5 Initialize LLM Explanation cache
-    cache_prompt_ver = f"{args.prompt_version}_no_few_shot" if args.no_few_shot else args.prompt_version
+    cache_prompt_ver = generation_run_version(args.prompt_version, args.generation_mode)
     expl_cache = ExplanationCache(
         domain_pair=args.domain_pair,
         model_name=args.model,
@@ -346,6 +342,8 @@ def main():
     version_suffix = "" if is_v1 else f"_{clean_version}"
     if args.no_few_shot:
         version_suffix += "_no_few_shot"
+    elif args.prompt_version == "v3":
+        version_suffix += "_few_shot"
     model_folder = f"{clean_model}{version_suffix}"
 
     output_basename = f"{args.domain_pair}_{model_folder}_{run_timestamp}"
@@ -419,6 +417,7 @@ def main():
                     prompts_dir=run_prompts_dir,
                     prompt_version=args.prompt_version,
                     include_few_shots=not args.no_few_shot,
+                    generation_mode=args.generation_mode,
                 )
                 prompt_files_map[iid] = p_file
         else:
@@ -439,6 +438,7 @@ def main():
                     prompts_dir=run_prompts_dir,
                     prompt_version=args.prompt_version,
                     include_few_shots=not args.no_few_shot,
+                    generation_mode=args.generation_mode,
                 )
                 prompt_files_map[iid] = p_file
 
@@ -801,6 +801,7 @@ def main():
         "target_domain": users_data[0]["target_domain"],
         "model": args.model,
         "prompt_version": args.prompt_version,
+        "generation_mode": args.generation_mode,
         "no_few_shot": args.no_few_shot,
         "generation_prompt": prompt_metadata,
         "sbert_model": args.sbert_model,
@@ -831,6 +832,7 @@ def main():
     print(f"Total Users Evaluated:           {len(users_data)}")
     print(f"Total Held-Out Items Evaluated:  {len(global_bleu_scores)}")
     print(f"Prompt Version:                  {args.prompt_version}")
+    print(f"Generation Mode:                 {args.generation_mode}")
     print(f"Few-Shot Demonstrations:         {'Disabled (--no_few_shot)' if args.no_few_shot else 'Enabled'}")
     print(f"Macro Average BLEU:              {macro_bleu:.4f}")
     print(f"Macro Average ROUGE-1 (F1):      {macro_r1:.4f}")

@@ -116,9 +116,15 @@ class ExplanationCache:
 
                 # Reports store version and the demonstration switch separately.
                 file_ver = data.get("prompt_version")
+                expected_mode = "zero-shot" if data.get("no_few_shot", False) else "few-shot"
+                recorded_mode = data.get("generation_mode", data.get("generation_prompt", {}).get("generation_mode"))
+                if recorded_mode is not None and recorded_mode != expected_mode:
+                    continue
                 report_cache_version = file_ver or ""
                 if data.get("no_few_shot", False):
                     report_cache_version += "_no_few_shot"
+                elif file_ver == "v3":
+                    report_cache_version += "_few_shot"
                 if self.is_v1:
                     if file_ver not in (None, "", "v1"):
                         continue

@@ -39,7 +39,10 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from llm_explainer.config import DOMAIN_CONFIGS
-from llm_explainer.prompt_builder import DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS
+from llm_explainer.prompt_builder import (
+    DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS, add_generation_mode_arguments,
+    normalize_generation_arguments, resolve_generation_mode, generation_prompt_metadata,
+)
 from llm_explainer.markdown_exporter import sanitize_model_name
 from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
 
@@ -109,22 +112,15 @@ def parse_args():
     parser.add_argument(
         "--prompt_version", "-pv", choices=GENERATION_PROMPT_VERSIONS,
         default=DEFAULT_PROMPT_VERSION,
-        help="Generation template: v3 (default, no examples) or legacy v2.",
+        help="Generation template: v3 (default) or legacy v2; examples selected by --generation_mode.",
     )
-    parser.add_argument(
-        "--no_few_shot",
-        action="store_true",
-        help="Remove legacy v2 style examples. V3 always uses no demonstrations.",
-    )
+    add_generation_mode_arguments(parser)
     parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Execute mock generation in validation script (dry run).",
     )
-    args = parser.parse_args()
-    if args.prompt_version == "v3":
-        args.no_few_shot = True
-    return args
+    return normalize_generation_arguments(parser.parse_args())
 
 
 def find_latest_results_file(
@@ -132,20 +128,25 @@ def find_latest_results_file(
     model_name: str,
     base_results_dir: str = "results",
     prompt_version: str = DEFAULT_PROMPT_VERSION,
-    no_few_shot: bool = False,
+    no_few_shot: Optional[bool] = None,
+    generation_mode: Optional[str] = None,
 ) -> Optional[str]:
     """
     Finds the most recent validation results JSON file for a given domain pair and model.
     Checks inside results/<domain_pair>/<model_folder>/ first, with fallback to results/<domain_pair>/.
     """
-    if prompt_version == "v3":
-        no_few_shot = True
+    if generation_mode is None and no_few_shot is not None:
+        generation_mode = "zero-shot" if no_few_shot else "few-shot"
+    mode = resolve_generation_mode(prompt_version, generation_mode)
+    no_few_shot = mode == "zero-shot"
     clean_model = sanitize_model_name(model_name)
     clean_version = sanitize_model_name(prompt_version) if prompt_version else ""
     is_v1 = not clean_version or clean_version.lower() == "v1"
     version_suffix = "" if is_v1 else f"_{clean_version}"
     if no_few_shot:
         version_suffix += "_no_few_shot"
+    elif prompt_version == "v3":
+        version_suffix += "_few_shot"
     model_folder = f"{clean_model}{version_suffix}"
 
     candidate_dir = os.path.join(REPO_ROOT, base_results_dir, domain_pair, model_folder)
@@ -175,6 +176,9 @@ def find_latest_results_file(
             if report.get("prompt_version") != prompt_version:
                 continue
             if bool(report.get("no_few_shot", False)) != no_few_shot:
+                continue
+            recorded_mode = report.get("generation_mode", report.get("generation_prompt", {}).get("generation_mode"))
+            if recorded_mode is not None and recorded_mode != mode:
                 continue
         except (OSError, ValueError, AttributeError):
             continue
@@ -251,6 +255,7 @@ def extract_judge_outputs_from_logs(logs: List[str]) -> Tuple[Optional[str], Opt
 
 def main():
     args = parse_args()
+    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode)
     start_time = datetime.datetime.now()
 
     print("\n" + "=" * 90)
@@ -259,6 +264,9 @@ def main():
     print(f"Domain Pair:         {args.domain_pair}")
     print(f"Generator Models:    {', '.join(DEFAULT_GENERATOR_MODELS)} ({len(DEFAULT_GENERATOR_MODELS)} models)")
     print(f"Generation Prompt:   {args.prompt_version}")
+    print(f"Generation Mode:     {args.generation_mode}")
+    print(f"Generation Template: {prompt_metadata['template_file'] or 'legacy v2 builder'}")
+    print(f"Template SHA-256:    {prompt_metadata['template_sha256'] or 'N/A'}")
     print(f"Number of Users:     {args.num_users}")
     print(f"Sentence-BERT Model: {args.sbert_model}")
     print(f"Validation Caches:   Disabled (--no_cache_llm, --no_cache_sbert)")
@@ -277,6 +285,7 @@ def main():
     for m in DEFAULT_GENERATOR_MODELS:
         run_records[m] = {
             "model": m,
+            "generation_mode": args.generation_mode,
             "gen_status": "Pending",
             "gen_json_file": None,
             "judge_status": "Pending",
@@ -305,14 +314,13 @@ def main():
                 "--domain_pair", args.domain_pair,
                 "--model", gen_model,
                 "--prompt_version", args.prompt_version,
+                "--generation_mode", args.generation_mode,
                 "--num_users", str(args.num_users),
                 "--no_cache_llm",
                 "--no_cache_sbert",
                 "--sbert_model", args.sbert_model,
                 "--ollama_url", args.ollama_url,
             ]
-            if args.no_few_shot:
-                cmd.append("--no_few_shot")
             if args.dry_run:
                 cmd.append("--dry_run")
 
@@ -437,6 +445,7 @@ def main():
     print("                        RIEPILOGO CONSOLIDATO PIPELINE DGCDR")
     print("=" * 115)
     print(f"Coppia di Dominio:        {args.domain_pair}")
+    print(f"Generation Prompt:       {args.prompt_version} / {args.generation_mode}")
     print(f"Utenti Valutati per Run:  {args.num_users}")
     print(f"Modello Judge:            {args.judge_model}")
     print(f"Judge Prompt:             {resolve_judge_prompt(args)[1]}")

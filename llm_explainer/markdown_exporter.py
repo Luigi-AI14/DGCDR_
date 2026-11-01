@@ -86,6 +86,11 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     if prompt_version:
         md.append(f"| **Prompt Version** | `{prompt_version}` |")
     generation_prompt = data.get("generation_prompt", {})
+    generation_mode = data.get("generation_mode", generation_prompt.get("generation_mode"))
+    if generation_mode:
+        md.append(f"| **Generation Mode** | `{generation_mode}` |")
+    if generation_prompt.get("demonstration_set"):
+        md.append(f"| **Generation Demonstration Set** | `{generation_prompt['demonstration_set']}` |")
     if generation_prompt.get("template_file"):
         md.append(f"| **Generation Template** | `{generation_prompt['template_file']}` |")
         md.append(f"| **Template SHA-256** | `{generation_prompt['template_sha256']}` |")
