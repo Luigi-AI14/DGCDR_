@@ -6,8 +6,8 @@ from llm_explainer.config import JUDGE_DEFAULTS
 
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
 JUDGE_PROMPTS = {
-    "zero-shot": os.path.join(PROMPTS_DIR, "TEST_PROMPT_ALIGNMENT_NO_NULL_ZERO_SHOT.txt"),
-    "few-shot": os.path.join(PROMPTS_DIR, "TEST_PROMPT_ALIGNMENT_NO_NULL_FEW_SHOT.txt"),
+    "zero-shot": os.path.join(PROMPTS_DIR, "JUDGE_PROMPT_ALIGNMENT_ZERO_SHOT.txt"),
+    "few-shot": os.path.join(PROMPTS_DIR, "JUDGE_PROMPT_ALIGNMENT_FEW_SHOT.txt"),
 }
 
 

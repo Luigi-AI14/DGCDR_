@@ -4,7 +4,7 @@ Orchestration pipeline script for DGCDR LLM Explanations and LLM-as-a-Judge Eval
 
 This script executes a two-phase pipeline across multiple models for a specified domain pair:
   Phase 1 (Generation & Validation):
-    Runs `run_llm_validation.py` for each of the 3 explanation generator models:
+    Runs `run_llm_explanations.py` for each of the 3 explanation generator models:
       - qwen3.5:9b
       - llama3.1:8b
       - gemma4:12b
@@ -12,7 +12,7 @@ This script executes a two-phase pipeline across multiple models for a specified
       --num_users 200 --no_cache_llm --no_cache_sbert --sbert_model BAAI/bge-large-en-v1.5
   
   Phase 2 (LLM-as-a-Judge Evaluation):
-    Runs `llm_explainer/judge/test_geval_prompts.py` for each generated JSON report
+    Runs `llm_explainer/judge/run_llm_judge.py` for each generated JSON report
     using the judge model:
       - qwen3.8:27b
     Results are saved under `results_judge/<domain_pair>/seed<seed>/<generator>/`.
@@ -139,7 +139,7 @@ def parse_args():
     if args.num_users < 1:
         parser.error("--num_users must be positive")
     try:
-        budget_settings(args.prompt_version, args.num_ctx)
+        budget_settings(args.prompt_version, args.num_ctx, args.domain_pair)
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -294,7 +294,7 @@ def extract_judge_outputs_from_logs(logs: List[str]) -> Tuple[Optional[str], Opt
 
 def run_seed(args):
     """Execute both phases for one frozen sampling cohort."""
-    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode)
+    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode, args.domain_pair)
     start_time = datetime.datetime.now()
 
     print("\n" + "=" * 90)
@@ -342,7 +342,7 @@ def run_seed(args):
         }
 
     # =========================================================================
-    # FASE 1: Generazione & Validazione Metriche (run_llm_validation.py)
+    # FASE 1: Generazione & Validazione Metriche (run_llm_explanations.py)
     # =========================================================================
     if not args.skip_generation:
         print("\n" + "#" * 90)
@@ -356,7 +356,7 @@ def run_seed(args):
 
             cmd = [
                 sys.executable,
-                os.path.join(REPO_ROOT, "run_llm_validation.py"),
+                os.path.join(REPO_ROOT, "run_llm_explanations.py"),
                 "--domain_pair", args.domain_pair,
                 "--model", gen_model,
                 "--prompt_version", args.prompt_version,
@@ -410,7 +410,7 @@ def run_seed(args):
                 print(f"  • {gen_model}: [ATTENZIONE] Nessun file di risultato trovato in {EXPLANATIONS_ROOT}/{args.domain_pair}/!")
 
     # =========================================================================
-    # FASE 2: Valutazione LLM-as-a-Judge (test_geval_prompts.py)
+    # FASE 2: Valutazione LLM-as-a-Judge (run_llm_judge.py)
     # =========================================================================
     if not args.skip_judge:
         print("\n\n" + "#" * 90)
@@ -438,7 +438,7 @@ def run_seed(args):
 
             cmd_judge = [
                 sys.executable,
-                os.path.join(REPO_ROOT, "llm_explainer", "judge", "test_geval_prompts.py"),
+                os.path.join(REPO_ROOT, "llm_explainer", "judge", "run_llm_judge.py"),
                 "--model", args.judge_model,
                 "--results_file", target_json,
                 "--num_users", str(args.num_users),

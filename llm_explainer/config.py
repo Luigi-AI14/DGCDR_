@@ -129,7 +129,7 @@ JUDGE_DEFAULTS = {
     "num_users": DEFAULT_SETTINGS["num_users"],
     "metrics": ["alignment"],
     "judge_prompt": "zero-shot",
-    "instance_prompt": os.path.join(BASE_DIR, "llm_explainer", "prompts", "TEST_PROMPT_INSTANCE.txt"),
+    "instance_prompt": os.path.join(BASE_DIR, "llm_explainer", "prompts", "JUDGE_INSTANCE_PROMPT.txt"),
     "temperature": DEFAULT_SETTINGS["temperature"],
     "seed": DEFAULT_INFERENCE_SEED,
     "num_ctx": 8192,

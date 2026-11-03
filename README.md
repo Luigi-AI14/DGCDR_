@@ -42,13 +42,30 @@ Explanation generation defaults to **v3 few-shot**; judge evaluation defaults to
 `--no_few_shot`) to disable generation examples, or `--judge_prompt few-shot` to
 enable judge examples.
 
-Generation prompt saving is disabled by default in both `run_llm_validation.py`
+Generation selects `llm_explainer/prompts/EXPLANATION_V3_<source>-<target>_FEW_SHOT.txt`
+or `EXPLANATION_V3_<source>-<target>_ZERO_SHOT.txt` using `--domain_pair` and
+`--generation_mode`. For example, the default is
+`EXPLANATION_V3_Cloth-Elec_FEW_SHOT.txt`. Reports, cache hashes and cohort
+token-budget checks use the selected pair's template.
+
+Each v3 generation file contains both instructions and an `INPUT` section.
+After filling the placeholders, the client sends the instructions (including
+few-shot demonstrations) in the system message and the `INPUT` section in the
+user message. Generation does not need a separate instance-template file.
+
+Judge evaluation uses `JUDGE_PROMPT_ALIGNMENT_ZERO_SHOT.txt` by default;
+`--judge_prompt few-shot` selects `JUDGE_PROMPT_ALIGNMENT_FEW_SHOT.txt`.
+`--system_prompt` continues to accept a custom judge file.
+Per-item judge data is formatted using `JUDGE_INSTANCE_PROMPT.txt`;
+`--instance_prompt` overrides this template.
+
+Generation prompt saving is disabled by default in both `run_llm_explanations.py`
 and `run_llm_explainer_pipeline.py`. Use `--save_prompts` to enable it, or
 `--no_save_prompts` to explicitly keep it disabled:
 
 ```powershell
 python run_llm_explainer_pipeline.py --all_seeds
-python run_llm_validation.py --seed 11 --save_prompts
+python run_llm_explanations.py --seed 11 --save_prompts
 ```
 
 The pipeline forwards this choice to every generation run. When disabled, no
@@ -191,6 +208,8 @@ Existing Python callers of
 `split_seed` and `sampling_seed` separately.
 
 Standalone judging defaults to `qwen3.8:27b` and 200 users, matching the pipeline.
+Run it with `python llm_explainer/judge/run_llm_judge.py --results_file <report.json>`
+or `python -m llm_explainer.judge.run_llm_judge --results_file <report.json>`.
 Other shared defaults are zero-shot alignment judging, temperature 0, inference
 seed 42, context 8192, initial token limit 256, one retry, weighted scoring enabled,
 and 20 top log probabilities. `--results_file` remains required; domain and sampling
@@ -203,10 +222,10 @@ pipeline and standalone defaults from drifting apart. For example:
 
 ```powershell
 # Same cohort/settings as the pipeline, running only one generator
-python run_llm_validation.py --model llama3.1:8b
+python run_llm_explanations.py --model llama3.1:8b
 
 # Explicit opt-ins for an independent five-user run with caches
-python run_llm_validation.py --independent_sampling --seed 42 --num_users 5 --cache_llm --cache_sbert
+python run_llm_explanations.py --independent_sampling --seed 42 --num_users 5 --cache_llm --cache_sbert
 ```
 
 ## Acknowledgement

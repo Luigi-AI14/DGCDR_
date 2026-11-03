@@ -22,7 +22,7 @@ TOKENIZERS = {
 CHAT_SAFETY_TOKENS = 256
 
 
-def budget_settings(prompt_version="v3", num_ctx=None):
+def budget_settings(prompt_version="v3", num_ctx=None, domain_pair=None):
     num_ctx = DEFAULT_SETTINGS["num_ctx"] if num_ctx is None else num_ctx
     input_budget = num_ctx - GENERATION_OUTPUT_TOKENS - CHAT_SAFETY_TOKENS
     if input_budget < 1:
@@ -31,7 +31,7 @@ def budget_settings(prompt_version="v3", num_ctx=None):
     return dict(version=1, num_ctx=num_ctx, output_tokens=GENERATION_OUTPUT_TOKENS,
                 chat_safety_tokens=CHAT_SAFETY_TOKENS, input_budget=input_budget,
                 prompt_version=prompt_version,
-                prompt_hashes={mode: generation_prompt_metadata(prompt_version, mode)["cache_sha256"]
+                prompt_hashes={mode: generation_prompt_metadata(prompt_version, mode, domain_pair)["cache_sha256"]
                                for mode in GENERATION_MODES},
                 tokenizers={model: dict(repo=TOKENIZERS[model][0], revision=TOKENIZERS[model][1])
                             for model in GENERATOR_MODELS})

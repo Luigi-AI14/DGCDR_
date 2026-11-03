@@ -45,7 +45,7 @@ def cohort_settings(domain_pair, num_users, split_seed, min_rating, min_words,
     return dict(domain_pair=domain_pair, num_users=num_users, split_seed=split_seed,
                 min_rating=min_rating, min_review_words=min_words,
                 cohort_seeds=list(COHORT_SEEDS),
-                prompt_budget=budget_settings(prompt_version, num_ctx))
+                prompt_budget=budget_settings(prompt_version, num_ctx, domain_pair))
 
 
 def sample_with_replacements(users, num_users, seed, check_user):

@@ -230,7 +230,7 @@ def parse_args():
     if args.num_users < 1:
         parser.error("--num_users must be positive")
     try:
-        budget_settings(args.prompt_version, args.num_ctx)
+        budget_settings(args.prompt_version, args.num_ctx, args.domain_pair)
     except ValueError as exc:
         parser.error(str(exc))
     if args.model not in GENERATOR_MODELS:
@@ -247,7 +247,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode)
+    prompt_metadata = generation_prompt_metadata(args.prompt_version, args.generation_mode, args.domain_pair)
     # Keep CLI help/template selection usable without loading the ML stack.
     from recbole.utils import init_seed
     from llm_explainer.data_extractor import DataExtractor
@@ -365,7 +365,7 @@ def main():
     # 4. Extract Data & Splits
     manifest = None
     selection_audit = None
-    token_budget = budget_settings(args.prompt_version, args.num_ctx)
+    token_budget = budget_settings(args.prompt_version, args.num_ctx, args.domain_pair)
     tokenizer_metadata = None
     if args.cohort_manifest:
         settings = cohort_settings(args.domain_pair, args.num_users, args.split_seed,

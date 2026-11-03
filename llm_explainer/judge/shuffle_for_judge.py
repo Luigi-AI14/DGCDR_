@@ -20,7 +20,7 @@ Features:
    - 'random_sampling': Random negative drawing with replacement.
 2. Full Provenance Tracking:
    - Stores original explanation, source item ID, source item title, and source user ID.
-   - Retains 100% schema compatibility with `test_geval_prompts.py`.
+   - Retains 100% schema compatibility with `run_llm_judge.py`.
 3. Integrated Pipeline Support:
    - Can generate the shuffled dataset only (`python shuffle_for_judge.py`).
    - Can immediately launch the Judge evaluation (`python shuffle_for_judge.py --run_judge --max_users 5`).
@@ -565,13 +565,13 @@ def run_judge_evaluation(
     judge_prompt: str = "zero-shot",
     system_prompt: Optional[str] = None,
 ) -> int:
-    """Runs test_geval_prompts.py on the shuffled dataset using the active Python interpreter."""
+    """Runs run_llm_judge.py on the shuffled dataset using the active Python interpreter."""
     if output_dir is None:
         source = read_report(shuffled_dataset_path) or {}
         output_dir = judge_directory(BASE_DIR, source, shuffled=True)
     cmd = [
         sys.executable,
-        os.path.join(BASE_DIR, "llm_explainer", "judge", "test_geval_prompts.py"),
+        os.path.join(BASE_DIR, "llm_explainer", "judge", "run_llm_judge.py"),
         "--results_file", shuffled_dataset_path,
         "--model", model,
         "--temperature", str(temperature),
@@ -1006,7 +1006,7 @@ def parse_args():
     parser.add_argument(
         "--run_judge",
         action="store_true",
-        help="Automatically launch LLM Judge (test_geval_prompts.py) on the generated shuffled dataset.",
+        help="Automatically launch LLM Judge (run_llm_judge.py) on the generated shuffled dataset.",
     )
     users = parser.add_mutually_exclusive_group()
     users.add_argument(

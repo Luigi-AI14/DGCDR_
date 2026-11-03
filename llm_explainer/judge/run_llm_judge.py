@@ -21,7 +21,7 @@ if REPO_ROOT not in sys.path:
 
 from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts, weighted_score_counts
 from llm_explainer.judge.markdown_report import format_outcome_count, score_distribution_markdown
-from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
+from llm_explainer.judge.prompt_selection import JUDGE_PROMPTS, add_judge_prompt_arguments, resolve_judge_prompt
 from llm_explainer.markdown_exporter import readable_model_name, available_report_basename
 from llm_explainer.result_paths import judge_directory, resolve_result_reference
 from llm_explainer.config import DEFAULT_SETTINGS, JUDGE_DEFAULTS
@@ -44,7 +44,7 @@ METRICS_REGISTRY: Dict[str, Dict[str, str]] = {
     "alignment": {
         "id": "alignment",
         "display_name": "Alignment",
-        "prompt_file": os.path.join(PROMPTS_DIR, "TEST_PROMPT_ALIGNMENT.txt"),
+        "prompt_file": JUDGE_PROMPTS[JUDGE_DEFAULTS["judge_prompt"]],
         "fallback_file": None,
     },
 }

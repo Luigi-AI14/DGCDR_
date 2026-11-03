@@ -9,13 +9,12 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from llm_explainer.config import DEFAULT_SETTINGS
+from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
 
 
 DEFAULT_PROMPT_VERSION = "v3"
 GENERATION_PROMPT_VERSIONS = ("v2", "v3")
-V3_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3.txt")
-V3_FEW_SHOT_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "prompts", "EXPLANATION_V3_FEW_SHOT.txt")
+PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 GENERATION_MODES = ("zero-shot", "few-shot")
 V3_REQUEST_PROTOCOL = "system_instance_json_schema_v1"
 
@@ -70,25 +69,37 @@ def split_generation_prompt(prompt: str) -> Tuple[Optional[str], str]:
     return None, prompt
 
 
-def load_generation_template(prompt_version: str, generation_mode: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve an actual template version rather than just labeling outputs."""
+def load_generation_template(
+    prompt_version: str, generation_mode: Optional[str] = None,
+    domain_pair: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Load the template for the selected version, mode and source-target pair."""
     if prompt_version not in GENERATION_PROMPT_VERSIONS:
         raise ValueError("Unsupported generation prompt version: %s" % prompt_version)
     if prompt_version == "v2":
         return None, None
     mode = resolve_generation_mode(prompt_version, generation_mode)
-    path = V3_FEW_SHOT_TEMPLATE_FILE if mode == "few-shot" else V3_TEMPLATE_FILE
+    pair = domain_pair or DEFAULT_SETTINGS["domain_pair"]
+    if pair not in DOMAIN_CONFIGS:
+        raise ValueError("Unsupported generation domain pair: %s" % pair)
+    suffix = mode.replace("-", "_").upper()
+    path = os.path.join(PROMPTS_DIR, "EXPLANATION_V3_%s_%s.txt" % (pair, suffix))
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read(), path
 
 
-def generation_prompt_metadata(prompt_version: str, generation_mode: Optional[str] = None) -> Dict[str, Any]:
+def generation_prompt_metadata(
+    prompt_version: str, generation_mode: Optional[str] = None,
+    domain_pair: Optional[str] = None,
+) -> Dict[str, Any]:
     mode = resolve_generation_mode(prompt_version, generation_mode)
-    template, path = load_generation_template(prompt_version, mode)
+    pair = domain_pair or DEFAULT_SETTINGS["domain_pair"]
+    template, path = load_generation_template(prompt_version, mode, pair)
     template_hash = hashlib.sha256(template.encode("utf-8")).hexdigest() if template is not None else None
     return {
         "version": prompt_version,
         "generation_mode": mode,
+        "domain_pair": pair,
         "demonstration_set": "v3_evidence_v1" if prompt_version == "v3" and mode == "few-shot" else ("v2_style" if mode == "few-shot" else None),
         "template_file": path,
         "template_sha256": template_hash,
@@ -238,7 +249,11 @@ def build_item_prompt(
         generation_mode = "few-shot" if include_few_shots else "zero-shot"
     mode = resolve_generation_mode(prompt_version, generation_mode)
     include_few_shots = mode == "few-shot"
-    template, _ = load_generation_template(prompt_version, mode)
+    domain_pair = (
+        "%s-%s" % (resolve_target_domain_key(source_domain_name), resolve_target_domain_key(target_domain_name))
+        if prompt_version == "v3" else None
+    )
+    template, _ = load_generation_template(prompt_version, mode, domain_pair)
     if template is not None:
         values = {
             "user_id": str(user_id), "source_domain_name": source_domain_name,

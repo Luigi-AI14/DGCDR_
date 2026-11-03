@@ -27,7 +27,7 @@ The following fictional examples illustrate how to use the supplied evidence.
 Their users, items, histories, and facts are unrelated to the actual input.
 Use only the actual input's candidate facts and history when answering it.
 
-DEMONSTRATION 1 — A SPECIFIC HISTORICAL NEED
+DEMONSTRATION 1 — A CLEAR TARGET-DOMAIN MATCH
 
 Example input:
 Source domain: Clothing
@@ -35,23 +35,39 @@ Target domain: Electronics
 User ID: EXAMPLE_USER_A
 
 [Source-domain history]
-No historical reviews recorded in this domain.
+1. Item ID: EXAMPLE_BLUE_SHIRT
+   Item Title: Blue cotton T-shirt
+   User Rating: 5.0 / 5.0
+   Review Title: Color as pictured
+   Review Text: The blue shade matched the picture, which is what I wanted.
+
+2. Item ID: EXAMPLE_CASUAL_SHOES
+   Item Title: Lace-up casual shoes
+   User Rating: 3.0 / 5.0
+   Review Title: Laces come undone
+   Review Text: The laces keep coming undone when I walk. I wish they stayed tied.
 
 [Target-domain history]
-1. Item ID: EXAMPLE_OLD_CABLE
-   Item Title: USB-C charging cable, 0.5 metres
-   User Rating: 4.0 / 5.0
-   Review Title: Too short for my desk
-   Review Text: The half-metre cable does not reach the outlet beside my desk.
+1. Item ID: EXAMPLE_OLD_KEYBOARD
+   Item Title: Full-size keyboard with numeric keypad
+   User Rating: 5.0 / 5.0
+   Review Title: Useful number keys
+   Review Text: I use the numeric keypad every week to enter figures. I would miss it on a replacement keyboard.
+
+2. Item ID: EXAMPLE_MOUSE
+   Item Title: Wireless mouse
+   User Rating: 5.0 / 5.0
+   Review Title: Quieter clicks
+   Review Text: The clicks sound quieter than those of my old mouse. I like that.
 
 [Candidate item]
-Item ID: EXAMPLE_CABLE
-Item title: USB-C charging cable, 2 metres
+Item ID: EXAMPLE_KEYBOARD
+Item title: Wired USB keyboard with numeric keypad
 
 Example output:
-{"item_id":"EXAMPLE_CABLE","item_title":"USB-C charging cable, 2 metres","explanation":"You previously noted that your half-metre charging cable was too short. This two-metre USB-C cable offers more reach between your device and the power source when charging."}
+{"item_id":"EXAMPLE_KEYBOARD","item_title":"Wired USB keyboard with numeric keypad","explanation":"With a numeric keypad for entering figures, this keyboard includes the feature you specifically valued on your previous model, making it a relevant option for that task."}
 
-DEMONSTRATION 2 — NO RELEVANT PERSONAL EVIDENCE
+DEMONSTRATION 2 — A SUPPORTED SOURCE-DOMAIN CONNECTION
 
 Example input:
 Source domain: Clothing
@@ -59,23 +75,39 @@ Target domain: Electronics
 User ID: EXAMPLE_USER_B
 
 [Source-domain history]
-1. Item ID: EXAMPLE_JACKET
-   Item Title: Hooded jacket
+1. Item ID: EXAMPLE_WALKING_JACKET
+   Item Title: Jacket with zippered pockets
    User Rating: 5.0 / 5.0
-   Review Title: Comfortable cuffs
-   Review Text: I like the soft cuffs on this jacket.
+   Review Title: A place for my key
+   Review Text: I like having a zippered pocket for my key on walks. That pocket is the feature I use most.
+
+2. Item ID: EXAMPLE_SWEATER
+   Item Title: Machine-washable sweater
+   User Rating: 4.0 / 5.0
+   Review Title: Simple care
+   Review Text: I liked being able to put this sweater in the washing machine instead of taking it to a cleaner.
 
 [Target-domain history]
-No historical reviews recorded in this domain.
+1. Item ID: EXAMPLE_EARPHONES
+   Item Title: Wired earphones
+   User Rating: 5.0 / 5.0
+   Review Title: Clear voices
+   Review Text: I could hear speech clearly when listening to podcasts. That was what I liked about these earphones.
+
+2. Item ID: EXAMPLE_USB_HUB
+   Item Title: Four-port USB hub
+   User Rating: 4.0 / 5.0
+   Review Title: More ports
+   Review Text: I needed extra USB ports for my desk. Having four ports was useful.
 
 [Candidate item]
-Item ID: EXAMPLE_READER
-Item title: USB smart card reader
+Item ID: EXAMPLE_PHONE_ARMBAND
+Item title: Phone armband with zippered key pocket
 
 Example output:
-{"item_id":"EXAMPLE_READER","item_title":"USB smart card reader","explanation":"This USB smart card reader provides a way to read smart cards through a USB connection."}
+{"item_id":"EXAMPLE_PHONE_ARMBAND","item_title":"Phone armband with zippered key pocket","explanation":"You liked having a zippered pocket for your key on walks. This phone armband includes a zippered key pocket, providing that storage feature alongside a place for your phone."}
 
-DEMONSTRATION 3 — A RELEVANT QUALIFICATION
+DEMONSTRATION 3 — HISTORIES WITHOUT A RELEVANT PERSONAL CONNECTION
 
 Example input:
 Source domain: Clothing
@@ -83,21 +115,37 @@ Target domain: Electronics
 User ID: EXAMPLE_USER_C
 
 [Source-domain history]
-No historical reviews recorded in this domain.
+1. Item ID: EXAMPLE_HOODED_JACKET
+   Item Title: Hooded jacket
+   User Rating: 5.0 / 5.0
+   Review Title: Comfortable cuffs
+   Review Text: I like the soft cuffs on this jacket. They feel comfortable around my wrists.
+
+2. Item ID: EXAMPLE_STRIPED_SOCKS
+   Item Title: Striped socks
+   User Rating: 4.0 / 5.0
+   Review Title: Liked the pattern
+   Review Text: The striped pattern was the part I liked most about these socks.
 
 [Target-domain history]
-1. Item ID: EXAMPLE_OLD_KEYBOARD
-   Item Title: Wireless keyboard
+1. Item ID: EXAMPLE_MOUSE
+   Item Title: Wireless mouse
    User Rating: 5.0 / 5.0
-   Review Title: Less clutter
-   Review Text: I liked the wireless connection because it kept cables off my desk.
+   Review Title: Quieter clicks
+   Review Text: I liked that the clicks sounded quieter than those of my old mouse.
+
+2. Item ID: EXAMPLE_LAPTOP_STAND
+   Item Title: Laptop stand with adjustable height
+   User Rating: 4.0 / 5.0
+   Review Title: A better viewing height
+   Review Text: I liked being able to raise my laptop screen to the viewing height I wanted.
 
 [Candidate item]
-Item ID: EXAMPLE_KEYBOARD
-Item title: Wired USB keyboard
+Item ID: EXAMPLE_READER
+Item title: USB smart card reader
 
 Example output:
-{"item_id":"EXAMPLE_KEYBOARD","item_title":"Wired USB keyboard","explanation":"This keyboard uses a wired USB connection. Since you previously valued a wireless keyboard for reducing desk clutter, that connection may be a drawback for your setup."}
+{"item_id":"EXAMPLE_READER","item_title":"USB smart card reader","explanation":"This USB smart card reader provides a way to read smart cards through a USB connection."}
 
 INPUT
 Source domain: {source_domain_name}
