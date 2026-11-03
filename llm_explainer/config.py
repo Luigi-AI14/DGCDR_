@@ -115,6 +115,7 @@ DEFAULT_SETTINGS = {
     "save_prompts": False,
     "output_dir": os.path.join(BASE_DIR, EXPLANATIONS_ROOT),
     "prompt_version": "v3",
+    "generation_mode": "few-shot",
     "no_few_shot": False,
     "bertscore_model": "roberta-large",
     "bertscore_batch_size": 16,

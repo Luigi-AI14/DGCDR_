@@ -37,6 +37,11 @@ python run_llm_explainer_pipeline.py --all_seeds --skip_generation
 `--seed` and `--all_seeds` are mutually exclusive. Existing generation-mode,
 domain-pair, user-count, dry-run and phase-skip options still apply to every run.
 
+Explanation generation defaults to **v3 few-shot**; judge evaluation defaults to
+**zero-shot**. These are independent: use `--generation_mode zero-shot` (or
+`--no_few_shot`) to disable generation examples, or `--judge_prompt few-shot` to
+enable judge examples.
+
 Generation prompt saving is disabled by default in both `run_llm_validation.py`
 and `run_llm_explainer_pipeline.py`. Use `--save_prompts` to enable it, or
 `--no_save_prompts` to explicitly keep it disabled:
@@ -72,7 +77,7 @@ and checksum are validated before reuse.
 Output filenames use single underscores between fields and readable dates:
 
 ```text
-explanations_qwen3.5-9b_v3-zero-shot_seed-11_2026-11-03_12-00-00.json
+explanations_qwen3.5-9b_v3-few-shot_seed-11_2026-11-03_12-00-00.json
 judge_qwen3.5-9b_by-qwen3.8-27b_zero-shot_seed-11_2026-11-03_12-00-00.json
 ```
 
@@ -84,20 +89,20 @@ names. All output types use domain/seed/generator folders:
 ```text
 results_explanations/
   cohorts/Cloth-Elec/users200.json
-  Cloth-Elec/seed11/qwen3.5_9b_v3_zero-shot/
+  Cloth-Elec/seed11/qwen3.5_9b_v3_few-shot/
     explanations_....json
     explanations_....md
     shuffled/
       explanations_..._shuffled-....json
       explanations_..._shuffled-....md
 results_judge/
-  Cloth-Elec/seed11/qwen3.5_9b_v3_zero-shot/
+  Cloth-Elec/seed11/qwen3.5_9b_v3_few-shot/
     judge_....json
     judge_....md
     benchmark_judge_congruent_vs_shuffled_....json
     benchmark_judge_congruent_vs_shuffled_....md
 results_judge_shuffled/
-  Cloth-Elec/seed11/qwen3.5_9b_v3_zero-shot/
+  Cloth-Elec/seed11/qwen3.5_9b_v3_few-shot/
     judge_..._shuffled_....json
     judge_..._shuffled_....md
 legacy_results/
@@ -132,7 +137,7 @@ their archived locations by the judge, shuffler and Markdown exporter. Automatic
 discovery and default cache imports use the active roots and do not scan the archive.
 
 Shuffled datasets also use single underscores and timestamps ending at seconds,
-for example `explanations_qwen3.5-9b_v3-zero-shot_shuffled-inter-user_seed-11_shuffle-seed-42_2026-11-03_12-00-00.json`.
+for example `explanations_qwen3.5-9b_v3-few-shot_shuffled-inter-user_seed-11_shuffle-seed-42_2026-11-03_12-00-00.json`.
 Here `seed-11` identifies the source user cohort; `shuffle-seed-42` identifies the
 shuffle permutation. The split seed stays inside the JSON and Markdown reports.
 The shuffled JSON and Markdown card share a basename, and duplicate names receive
@@ -140,7 +145,7 @@ the same short numeric suffix used by generation and judge reports.
 
 Standalone validation uses the same defaults as the pipeline: 200 users, sampling
 seed 11, split/inference seeds 42, `BAAI/bge-large-en-v1.5`, disabled explanation
-and embedding caches, v3 zero-shot generation, and no saved prompts. The default
+and embedding caches, v3 few-shot generation, and no saved prompts. The default
 generator is `qwen3.5:9b`; select another pipeline generator with `--model`.
 
 Frozen cohorts are selected automatically using

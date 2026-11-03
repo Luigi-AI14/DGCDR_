@@ -9,6 +9,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from llm_explainer.config import DEFAULT_SETTINGS
 
 
 DEFAULT_PROMPT_VERSION = "v3"
@@ -20,8 +21,8 @@ V3_REQUEST_PROTOCOL = "system_instance_json_schema_v1"
 
 
 def resolve_generation_mode(prompt_version, generation_mode=None, no_few_shot=False):
-    """Preserve legacy defaults: v3 zero-shot, v2 few-shot."""
-    mode = generation_mode or ("zero-shot" if no_few_shot or prompt_version == "v3" else "few-shot")
+    """Default generation to few-shot; honor explicit modes and the legacy alias."""
+    mode = generation_mode or ("zero-shot" if no_few_shot else DEFAULT_SETTINGS["generation_mode"])
     if mode not in GENERATION_MODES:
         raise ValueError("Unsupported generation mode: %s" % mode)
     return mode
@@ -31,7 +32,7 @@ def add_generation_mode_arguments(parser, no_few_shot_default=False):
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--generation_mode", choices=GENERATION_MODES, default=None,
-        help="Explanation generation examples: zero-shot or few-shot (default: zero-shot for v3, few-shot for v2). Independent of --judge_prompt.",
+        help=f"Explanation generation examples: zero-shot or few-shot (default: {DEFAULT_SETTINGS['generation_mode']}). Independent of --judge_prompt.",
     )
     group.add_argument(
         "--no_few_shot", action="store_true", default=no_few_shot_default,
