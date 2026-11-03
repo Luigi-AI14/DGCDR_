@@ -74,6 +74,39 @@ The manifest is a frozen snapshot. To prepare new cohorts after changing the dat
 or filtering rules, archive the existing manifest before rerunning. Its settings
 and checksum are validated before reuse.
 
+Before freezing cohorts, each seed samples its initial users and checks their
+complete generation prompts with the Qwen, Llama, and Gemma tokenizers. Users
+whose prompts exceed the input budget are discarded and replaced by additional
+draws from the same seeded random generator, without resetting it. Accepted
+users keep their full histories: no review is shortened. Rejected users are not
+drawn again, and the five final cohorts remain disjoint. If too few users fit,
+preparation fails without saving a partial manifest.
+
+The default context is 32,768 tokens. The check reserves 4,096 output tokens and
+256 tokens for chat formatting and safety, leaving **28,416 message-content
+tokens**. It checks every candidate title and both generation modes so all three
+models and zero-shot/few-shot runs share the same final users. The candidate's
+held-out review is not used in this check. `--num_ctx` controls generation context
+in both the pipeline and standalone validator; `--judge_num_ctx` remains separate.
+
+The manifest and explanation JSON reports record the initial user IDs, excluded
+users with token counts and reasons, replacement IDs in draw order, final IDs,
+budget settings, and tokenizer revisions/checksums. The exclusion count makes
+the restriction to users with fitting histories measurable.
+
+Only tokenizer files are downloaded, once, into `cache/generation_tokenizers/`;
+cached runs work offline. Install the tokenizer dependencies from
+`requirements.txt` in the execution environment. No model weights are loaded
+for this preprocessing step. `--independent_sampling` applies the same check
+and replacement rule to its single sample. Mock `--dry_run` generation also
+performs the eligibility check.
+
+**Existing manifests from before this filtering rule are rejected.** Archive
+`results_explanations/cohorts/<domain_pair>/users<num_users>.json` before the first
+new run (or give the standalone validator a new `--cohort_manifest` path). Old
+manifests are never overwritten automatically. A change to the context budget,
+prompt version, or template also requires a new manifest.
+
 Output filenames use single underscores between fields and readable dates:
 
 ```text

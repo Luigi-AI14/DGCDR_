@@ -20,13 +20,15 @@ import logging
 import os
 import sys
 
-from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
+from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS, GENERATOR_MODELS
 from llm_explainer.result_paths import explanation_directory
 from llm_explainer.cohorts import (
     COHORT_SEEDS, DEFAULT_SPLIT_SEED, DEFAULT_INFERENCE_SEED, cohort_settings,
     load_or_prepare_manifest, select_cohort,
     default_manifest_path,
+    sample_with_replacements,
 )
+from llm_explainer.history_budget import HistoryBudget, budget_settings
 from llm_explainer.explanation_cache import ExplanationCache
 from llm_explainer.markdown_exporter import (
     generate_markdown_report, readable_model_name, available_report_basename,
@@ -227,6 +229,13 @@ def parse_args():
     args = normalize_generation_arguments(parser.parse_args())
     if args.num_users < 1:
         parser.error("--num_users must be positive")
+    try:
+        budget_settings(args.prompt_version, args.num_ctx)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.model not in GENERATOR_MODELS:
+        parser.error("History-budget checks need a tokenizer for this model; add it to "
+                     "GENERATOR_MODELS and history_budget.TOKENIZERS first.")
     if not args.independent_sampling and args.cohort_manifest is None:
         args.cohort_manifest = default_manifest_path(args.output_dir, args.domain_pair, args.num_users)
     if args.cohort_manifest and args.seed not in COHORT_SEEDS:
@@ -355,11 +364,17 @@ def main():
 
     # 4. Extract Data & Splits
     manifest = None
+    selection_audit = None
+    token_budget = budget_settings(args.prompt_version, args.num_ctx)
+    tokenizer_metadata = None
     if args.cohort_manifest:
         settings = cohort_settings(args.domain_pair, args.num_users, args.split_seed,
-                                   args.rating_threshold, args.min_review_words)
+                                   args.rating_threshold, args.min_review_words,
+                                   args.prompt_version, args.num_ctx)
         manifest = load_or_prepare_manifest(args.cohort_manifest, settings)
         users_data = select_cohort(manifest, args.seed)
+        selection_audit = next(c["selection_audit"] for c in manifest["cohorts"] if c["seed"] == args.seed)
+        tokenizer_metadata = manifest["tokenizer_metadata"]
         split_fingerprints = manifest["split_fingerprints"]
         logger.info("Frozen cohort: %s (SHA-256 %s)", args.cohort_manifest, manifest["sha256"])
     else:
@@ -370,7 +385,13 @@ def main():
             min_rating=args.rating_threshold,
             min_held_out_words=args.min_review_words,
         )
-        users_data = extractor.get_users_for_validation(num_users=args.num_users)
+        pool = extractor.get_users_for_validation(num_users=sys.maxsize)
+        if len(pool) < args.num_users:
+            raise ValueError(f"Need {args.num_users} eligible users; only {len(pool)} available.")
+        budget = HistoryBudget(token_budget)
+        users_data, selection_audit = sample_with_replacements(
+            sorted(pool, key=lambda user: user["user_id"]), args.num_users, args.seed, budget.check_user)
+        tokenizer_metadata = budget.metadata
         split_fingerprints = extractor.split_fingerprints
     if not users_data:
         logger.error("No eligible users found matching all constraints!")
@@ -860,6 +881,9 @@ def main():
         "split_fingerprints": split_fingerprints,
         "cohort_manifest": os.path.abspath(args.cohort_manifest) if args.cohort_manifest else None,
         "cohort_sha256": manifest["sha256"] if manifest else None,
+        "prompt_budget": token_budget,
+        "tokenizer_metadata": tokenizer_metadata,
+        "selection_audit": selection_audit,
         "selected_user_ids": [user["user_id"] for user in users_data],
         "temperature": args.temperature,
         "rating_threshold": args.rating_threshold,

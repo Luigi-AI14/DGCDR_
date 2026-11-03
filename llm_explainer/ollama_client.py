@@ -14,6 +14,20 @@ from typing import Any, Dict, List, Optional
 from llm_explainer.prompt_builder import split_generation_prompt
 
 logger = logging.getLogger(__name__)
+GENERATION_OUTPUT_TOKENS = 4096
+
+
+def generation_messages(prompt):
+    """Share the exact message contents between generation and token budgeting."""
+    system = (
+        "You are an expert Recommender System AI assistant specializing in personalized explanation generation. "
+        "You MUST reply strictly with a raw JSON object conforming to the requested schema. "
+        "Never output chain-of-thought, reasoning notes, drafts, or markdown fences before or after the JSON."
+    )
+    instructions, instance = split_generation_prompt(prompt)
+    if instructions is not None:
+        system += "\n\n" + instructions
+    return [{"role": "system", "content": system}, {"role": "user", "content": instance}]
 
 
 class OllamaClient:
@@ -48,27 +62,17 @@ class OllamaClient:
     def _call_ollama_api(self, prompt: str, expected_item: Optional[Dict[str, str]] = None) -> str:
         """Internal helper to send a prompt to Ollama /api/chat and return raw text."""
         url = f"{self.base_url}/api/chat"
-        system_instruction = (
-            "You are an expert Recommender System AI assistant specializing in personalized explanation generation. "
-            "You MUST reply strictly with a raw JSON object conforming to the requested schema. "
-            "Never output chain-of-thought, reasoning notes, drafts, or markdown fences before or after the JSON."
-        )
-        instructions, instance = split_generation_prompt(prompt)
-        if instructions is not None:
-            system_instruction += "\n\n" + instructions
+        instructions, _ = split_generation_prompt(prompt)
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": instance},
-            ],
+            "messages": generation_messages(prompt),
             "stream": False,
             "think": self.think,
             "options": {
                 "temperature": self.temperature,
                 "seed": self.seed,
                 "num_ctx": self.num_ctx,
-                "num_predict": 4096,
+                "num_predict": GENERATION_OUTPUT_TOKENS,
             },
         }
         if instructions is not None and expected_item is not None:

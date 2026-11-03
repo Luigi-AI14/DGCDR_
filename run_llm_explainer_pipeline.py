@@ -44,6 +44,7 @@ if REPO_ROOT not in sys.path:
 from llm_explainer.config import DOMAIN_CONFIGS, DEFAULT_SETTINGS, JUDGE_DEFAULTS, GENERATOR_MODELS
 from llm_explainer.result_paths import EXPLANATIONS_ROOT, generator_folder, judge_directory
 from llm_explainer.cohorts import COHORT_SEEDS, DEFAULT_SPLIT_SEED, DEFAULT_INFERENCE_SEED, default_manifest_path
+from llm_explainer.history_budget import budget_settings
 from llm_explainer.prompt_builder import (
     DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS, add_generation_mode_arguments,
     normalize_generation_arguments, resolve_generation_mode, generation_prompt_metadata,
@@ -112,6 +113,8 @@ def parse_args():
     parser.add_argument("--instance_prompt", default=None, help="Judge instance template override")
     parser.add_argument("--judge_max_tokens", type=int, default=JUDGE_DEFAULTS["max_tokens"])
     parser.add_argument("--judge_num_ctx", type=int, default=JUDGE_DEFAULTS["num_ctx"])
+    parser.add_argument("--num_ctx", type=int, default=DEFAULT_SETTINGS["num_ctx"],
+                        help="Generation context and cohort token-budget limit (default: 32768).")
     parser.add_argument("--judge_top_logprobs", type=int, default=JUDGE_DEFAULTS["top_logprobs"])
     parser.add_argument("--no_weighted_scoring", action="store_true", default=JUDGE_DEFAULTS["no_weighted_scoring"], help="Disable judge token-probability scoring")
     parser.add_argument("--judge_num_gpu", type=int, default=JUDGE_DEFAULTS["num_gpu"], help="Judge GPU layers; 0 requests CPU execution")
@@ -135,6 +138,10 @@ def parse_args():
     args = normalize_generation_arguments(parser.parse_args())
     if args.num_users < 1:
         parser.error("--num_users must be positive")
+    try:
+        budget_settings(args.prompt_version, args.num_ctx)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -355,6 +362,7 @@ def run_seed(args):
                 "--prompt_version", args.prompt_version,
                 "--generation_mode", args.generation_mode,
                 "--num_users", str(args.num_users),
+                "--num_ctx", str(args.num_ctx),
                 "--split_seed", str(DEFAULT_SPLIT_SEED),
                 "--seed", str(args.seed),
                 "--inference_seed", str(DEFAULT_INFERENCE_SEED),
