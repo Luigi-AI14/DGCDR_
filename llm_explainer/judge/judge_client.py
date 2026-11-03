@@ -5,6 +5,7 @@ import math
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+from llm_explainer.config import JUDGE_DEFAULTS
 
 
 RESPONSE_SCHEMA = {
@@ -154,7 +155,7 @@ def extract_weighted_score(content: str, logprobs: Any) -> Dict[str, Any]:
 def call_ollama_judge(
     system_prompt: str,
     instance_prompt: str,
-    model: str = "llama3.1:8b",
+    model: str = JUDGE_DEFAULTS["model"],
     temperature: float = 0.0,
     seed: int = 42,
     ollama_url: str = "http://localhost:11434",

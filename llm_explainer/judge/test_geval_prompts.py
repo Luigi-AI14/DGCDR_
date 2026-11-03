@@ -22,6 +22,9 @@ if REPO_ROOT not in sys.path:
 from llm_explainer.judge.judge_client import call_ollama_judge, judgment_counts, weighted_score_counts
 from llm_explainer.judge.markdown_report import format_outcome_count, score_distribution_markdown
 from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
+from llm_explainer.markdown_exporter import readable_model_name, available_report_basename
+from llm_explainer.result_paths import judge_directory, resolve_result_reference
+from llm_explainer.config import DEFAULT_SETTINGS, JUDGE_DEFAULTS
 
 try:
     from llm_explainer.quintiles import QuintileManager, count_words
@@ -196,6 +199,7 @@ def extract_users_from_results(
     Classifies items into review length quintiles (Q1-Q5).
     Returns (extracted_users, stats_dict).
     """
+    results_path = resolve_result_reference(results_path, REPO_ROOT)
     if not os.path.exists(results_path):
         raise FileNotFoundError(f"File risultati non trovato: {results_path}")
 
@@ -295,6 +299,15 @@ def extract_users_from_results(
         "is_shuffled": data.get("is_shuffled", False),
         "shuffle_info": data.get("shuffle_info", {}),
         "domain_pair": domain_pair,
+        "generator_model": data.get("model", "unknown-generator"),
+        "prompt_version": data.get("prompt_version"),
+        "generation_mode": data.get("generation_mode"),
+        "no_few_shot": data.get("no_few_shot", False),
+        "split_seed": data.get("split_seed"),
+        "sampling_seed": data.get("sampling_seed"),
+        "split_fingerprints": data.get("split_fingerprints"),
+        "cohort_sha256": data.get("cohort_sha256"),
+        "cohort_manifest": data.get("cohort_manifest"),
     }
 
     return extracted, stats
@@ -307,6 +320,9 @@ def save_results_json(output_file: str, summary: Dict[str, Any], evaluated_users
     Includes judge reasons, response statuses and raw attempt diagnostics.
     """
     payload = {
+        "split_seed": summary.get("split_seed"),
+        "sampling_seed": summary.get("sampling_seed"),
+        "selected_user_ids": [user["user_id"] for user in evaluated_users],
         "global_mean_score": summary["global_mean_score"],
         "global_mean_weighted_score": summary["global_mean_weighted_score"],
         "total_users_evaluated": summary["total_users_evaluated"],
@@ -357,6 +373,9 @@ def save_results_markdown(output_file: str, summary: Dict[str, Any], evaluated_u
         f"- **Metric**: `{summary['metric_name']}` (`{summary['metric_id']}`)",
         f"- **Judge Prompt Version**: `{summary['protocol_metadata']['judge_prompt_version']}`",
         f"- **Judge System Prompt**: `{summary['protocol_metadata']['system_prompt_file']}`",
+        f"- **RecBole Split Seed**: `{summary.get('split_seed', 'N/A')}`",
+        f"- **User Sampling Seed**: `{summary.get('sampling_seed', 'N/A')}`",
+        f"- **Judge Inference Seed**: `{summary['protocol_metadata'].get('seed', 'N/A')}`",
         f"- **Global Mean Score**: {mean_s_str}",
         f"- **Global Mean Weighted Score**: {mean_w_str}",
         f"- **Attempted Items**: {counts['attempted_count']}",
@@ -488,11 +507,17 @@ def evaluate_single_metric(
     is_shuffled_data = stats.get("is_shuffled", False) or any(it.get("is_shuffled") for u in users_data for it in u.get("items", []))
     shuffled_tag = "_shuffled" if is_shuffled_data else ""
 
-    clean_model_name = args.model.replace(":", "_").replace("/", "_")
+    clean_model_name = readable_model_name(args.model)
+    generator_name = readable_model_name(stats.get("generator_model", "unknown-generator"))
     domain_pair = stats.get("domain_pair", "Cloth-Elec")
-    prompt_tag = judge_prompt_version.replace("-", "_")
-    json_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}_{prompt_tag}{shuffled_tag}_{now_str}.json"
-    md_filename = f"geval_{domain_pair}_{metric_id}_{clean_model_name}_{prompt_tag}{shuffled_tag}_{now_str}.md"
+    prompt_tag = judge_prompt_version
+    seed_tag = ""
+    if stats.get("sampling_seed") is not None:
+        seed_tag = f"_seed-{stats['sampling_seed']}"
+    basename = f"judge_{generator_name}_by-{clean_model_name}_{prompt_tag}{shuffled_tag}{seed_tag}_{now_str}"
+    basename = available_report_basename(basename, args.output_dir)
+    json_filename = basename + ".json"
+    md_filename = basename + ".md"
     json_output_path = os.path.join(args.output_dir, json_filename)
     md_output_path = os.path.join(args.output_dir, md_filename)
 
@@ -684,6 +709,8 @@ def evaluate_single_metric(
         "temperature": args.temperature,
         "timestamp": datetime.datetime.now().isoformat(),
         "source_results": args.results_file,
+        "split_seed": stats.get("split_seed"),
+        "sampling_seed": stats.get("sampling_seed"),
         "is_shuffled": stats.get("is_shuffled", False),
         "shuffle_info": stats.get("shuffle_info", {}),
         "judgment_counts": judgment_counts(all_evaluated_items),
@@ -699,6 +726,14 @@ def evaluate_single_metric(
             "system_prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
             "instance_prompt_sha256": hashlib.sha256(instance_template.encode("utf-8")).hexdigest(),
             "seed": args.seed,
+            "generator_model": stats.get("generator_model"),
+            "prompt_version": stats.get("prompt_version"),
+            "generation_mode": stats.get("generation_mode"),
+            "split_seed": stats.get("split_seed"),
+            "sampling_seed": stats.get("sampling_seed"),
+            "split_fingerprints": stats.get("split_fingerprints"),
+            "cohort_sha256": stats.get("cohort_sha256"),
+            "cohort_manifest": stats.get("cohort_manifest"),
             "max_tokens": args.max_tokens,
             "num_ctx": args.num_ctx,
             "max_retries": args.max_retries,
@@ -730,78 +765,87 @@ def evaluate_single_metric(
     return json_output_path, md_output_path
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate review alignment with a zero-shot or few-shot judge prompt on Ollama")
-    parser.add_argument("--model", type=str, default="llama3.1:8b", help="LLM judge model (default: llama3.1:8b)")
+    parser.add_argument("--model", type=str, default=JUDGE_DEFAULTS["model"],
+                        help=f"LLM judge model (default: {JUDGE_DEFAULTS['model']})")
     parser.add_argument(
         "--metrics",
         "--metric",
         nargs="+",
-        default=["alignment"],
+        default=JUDGE_DEFAULTS["metrics"],
         help="Metric to evaluate (default: alignment)",
     )
     add_judge_prompt_arguments(parser)
-    parser.add_argument("--num_ctx", type=int, default=8192,
+    parser.add_argument("--num_ctx", type=int, default=JUDGE_DEFAULTS["num_ctx"],
                         help="Ollama judge context size (default: 8192)")
-    parser.add_argument("--max_retries", type=int, default=1,
+    parser.add_argument("--max_retries", type=int, default=JUDGE_DEFAULTS["max_retries"],
                         help="Retries for technical failures; valid nulls are not retried")
-    parser.add_argument("--top_logprobs", type=int, default=20,
+    parser.add_argument("--top_logprobs", type=int, default=JUDGE_DEFAULTS["top_logprobs"],
                         help="Token alternatives for weighted scoring, 1-20 (default: 20)")
-    parser.add_argument("--no_weighted_scoring", action="store_true", help="Disable token-probability scoring")
-    parser.add_argument("--num_gpu", type=int, default=None,
+    parser.add_argument("--no_weighted_scoring", action="store_true", default=JUDGE_DEFAULTS["no_weighted_scoring"], help="Disable token-probability scoring")
+    parser.add_argument("--num_gpu", type=int, default=JUDGE_DEFAULTS["num_gpu"],
                         help="Ollama GPU layers; 0 requests CPU execution (default: server setting)")
     parser.add_argument(
         "--instance_prompt",
         type=str,
-        default=os.path.join(PROMPTS_DIR, "TEST_PROMPT_INSTANCE.txt"),
+        default=JUDGE_DEFAULTS["instance_prompt"],
         help="Path to instance prompt template",
     )
     parser.add_argument(
         "--results_file",
         type=str,
-        default="results/Cloth-Elec/llama3.1_8b_v2/Cloth-Elec_llama3.1_8b_v2_20260930_164711.json",
-        help="Path to results JSON file",
+        default=None,
+        help="Path to an explanation JSON report (required). Archived references are supported.",
     )
-    parser.add_argument(
+    users = parser.add_mutually_exclusive_group()
+    users.add_argument(
         "--num_users",
         "--max_users",
         type=int,
-        default=None,
-        help="Number of users to evaluate (default: None, processes all users in results file)",
+        default=JUDGE_DEFAULTS["num_users"],
+        help=f"Number of users to evaluate (default: {JUDGE_DEFAULTS['num_users']}).",
     )
+    users.add_argument("--all_users", dest="num_users", action="store_const", const=None,
+                       help="Evaluate all users in the input report instead of the default limit.")
     parser.add_argument(
         "--min_words",
         "--min_review_words",
         type=int,
-        default=5,
+        default=DEFAULT_SETTINGS["min_review_words"],
         help="Minimum word count filter for user reviews (default: 5, excludes < 5 words)",
     )
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0)")
-    parser.add_argument("--seed", type=int, default=42, help="Seed (default: 42)")
+    parser.add_argument("--temperature", type=float, default=JUDGE_DEFAULTS["temperature"], help="Sampling temperature (default: 0.0)")
+    parser.add_argument("--seed", type=int, default=JUDGE_DEFAULTS["seed"], help="Judge inference seed (default: 42)")
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=256,
+        default=JUDGE_DEFAULTS["max_tokens"],
         help="Max tokens for JSON reason and score (default: 256)",
     )
-    parser.add_argument("--ollama_url", type=str, default="http://localhost:11434", help="Ollama URL")
+    parser.add_argument("--ollama_url", type=str, default=JUDGE_DEFAULTS["ollama_url"], help="Ollama URL")
     parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to save JSON and MD output files (default: results_judge/<domain_pair>)",
+        help="Output root defaults to results_judge or results_judge_shuffled, grouped by domain/seed/generator.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.num_users is not None and args.num_users < 1:
+        parser.error("--num_users must be positive")
     if args.max_tokens < 1 or args.num_ctx < 1 or args.max_retries not in (0, 1):
         parser.error("max_tokens/num_ctx must be positive; max_retries must be 0 or 1")
     if not 1 <= args.top_logprobs <= 20 or (args.num_gpu is not None and args.num_gpu < 0):
         parser.error("top_logprobs must be 1-20; num_gpu must be nonnegative")
 
-    # Normalizzazione percorsi file rispetto a REPO_ROOT se necessario
-    if not os.path.exists(args.results_file):
-        candidate_res = os.path.join(REPO_ROOT, args.results_file)
-        if os.path.exists(candidate_res):
-            args.results_file = candidate_res
+    if not args.results_file:
+        parser.error("--results_file is required")
+    args.results_file = resolve_result_reference(args.results_file, REPO_ROOT)
+    return args
+
+
+def main():
+    args = parse_args()
 
     # Risoluzione metriche selezionate
     all_metric_keys = list(METRICS_REGISTRY.keys())
@@ -831,14 +875,13 @@ def main():
 
     # Risoluzione cartella di output dinamica in base al domain_pair
     if args.output_dir is None:
-        domain_pair = stats.get("domain_pair", "Cloth-Elec")
-        args.output_dir = os.path.join(REPO_ROOT, "results_judge", domain_pair)
+        args.output_dir = judge_directory(REPO_ROOT, stats, shuffled=stats.get("is_shuffled", False))
     elif not os.path.isabs(args.output_dir):
         args.output_dir = os.path.join(REPO_ROOT, args.output_dir)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     print("=================================================================")
     print("                  REVIEW ALIGNMENT JUDGE (JSON)                  ")

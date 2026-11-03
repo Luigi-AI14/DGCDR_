@@ -4,6 +4,8 @@ Provides dataset paths, RecBole config files, and metadata mapping per domain pa
 """
 
 import os
+from llm_explainer.result_paths import EXPLANATIONS_ROOT
+from llm_explainer.cohorts import COHORT_SEEDS, DEFAULT_INFERENCE_SEED
 
 # Base directory of the repository
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -97,22 +99,44 @@ DOMAIN_CONFIGS = {
 
 DEFAULT_SETTINGS = {
     "domain_pair": "Cloth-Elec",
-    "seed": 42,
+    "seed": COHORT_SEEDS[0],
     "temperature": 0.0,
     "rating_threshold": 4.0,
-    "num_users": 5,
+    "num_users": 200,
     "model_name": "qwen3.5:9b",
-    "sbert_model": "all-MiniLM-L6-v2",
+    "sbert_model": "BAAI/bge-large-en-v1.5",
+    "no_cache_llm": True,
+    "no_cache_sbert": True,
     "min_review_words": 5,
     "use_title_in_quintiles": True,
     "num_ctx": 32768,
     "ollama_url": "http://localhost:11434",
     "prompts_dir": os.path.join(BASE_DIR, "saved_prompts"),
-    "output_dir": os.path.join(BASE_DIR, "results"),
+    "save_prompts": False,
+    "output_dir": os.path.join(BASE_DIR, EXPLANATIONS_ROOT),
     "prompt_version": "v3",
     "no_few_shot": False,
     "bertscore_model": "roberta-large",
     "bertscore_batch_size": 16,
     "bertscore_rescale_with_baseline": True,
+}
+
+# Pipeline and standalone entry points use these same defaults.
+GENERATOR_MODELS = (DEFAULT_SETTINGS["model_name"], "llama3.1:8b", "gemma4:12b")
+JUDGE_DEFAULTS = {
+    "model": "qwen3.8:27b",
+    "num_users": DEFAULT_SETTINGS["num_users"],
+    "metrics": ["alignment"],
+    "judge_prompt": "zero-shot",
+    "instance_prompt": os.path.join(BASE_DIR, "llm_explainer", "prompts", "TEST_PROMPT_INSTANCE.txt"),
+    "temperature": DEFAULT_SETTINGS["temperature"],
+    "seed": DEFAULT_INFERENCE_SEED,
+    "num_ctx": 8192,
+    "max_tokens": 256,
+    "max_retries": 1,
+    "top_logprobs": 20,
+    "no_weighted_scoring": False,
+    "num_gpu": None,
+    "ollama_url": DEFAULT_SETTINGS["ollama_url"],
 }
 

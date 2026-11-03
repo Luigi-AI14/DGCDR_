@@ -5,7 +5,7 @@ Pipeline steps:
 1. Filter dataset keeping rating >= 4.0 and non-empty reviews (check_review_null.py criteria).
 2. Extract user history (100% source, 80% target) enriched with item titles, review titles and texts.
 3. Extract target held-out items (remaining 20% target test set).
-4. Compose a personalized English prompt per user/item using v3 (or legacy v2), and save it.
+4. Compose a personalized English prompt per user/item using v3 (or legacy v2), and optionally save it.
 5. Generate explanations using Qwen 3.5 9B via Ollama.
 6. Compute syntactic metrics (BLEU, ROUGE-1, ROUGE-2, ROUGE-L) comparing explanation vs actual user review.
 7. Compute user-level and global average metrics.
@@ -21,8 +21,16 @@ import os
 import sys
 
 from llm_explainer.config import DEFAULT_SETTINGS, DOMAIN_CONFIGS
+from llm_explainer.result_paths import explanation_directory
+from llm_explainer.cohorts import (
+    COHORT_SEEDS, DEFAULT_SPLIT_SEED, DEFAULT_INFERENCE_SEED, cohort_settings,
+    load_or_prepare_manifest, select_cohort,
+    default_manifest_path,
+)
 from llm_explainer.explanation_cache import ExplanationCache
-from llm_explainer.markdown_exporter import generate_markdown_report, sanitize_model_name
+from llm_explainer.markdown_exporter import (
+    generate_markdown_report, readable_model_name, available_report_basename,
+)
 from llm_explainer.metrics import (
     ReferenceEmbeddingCache,
     batch_compute_bert_score,
@@ -38,6 +46,7 @@ from llm_explainer.prompt_builder import (
     DEFAULT_PROMPT_VERSION, GENERATION_PROMPT_VERSIONS, build_item_prompt,
     generation_prompt_metadata, add_generation_mode_arguments,
     normalize_generation_arguments, generation_run_version,
+    add_prompt_saving_arguments,
 )
 
 logging.basicConfig(
@@ -57,7 +66,7 @@ def parse_args():
         "-n",
         type=int,
         default=DEFAULT_SETTINGS["num_users"],
-        help="Number of users to validate (default: 5).",
+        help=f"Number of users to validate (default: {DEFAULT_SETTINGS['num_users']}).",
     )
     parser.add_argument(
         "--domain_pair",
@@ -72,8 +81,17 @@ def parse_args():
         "-s",
         type=int,
         default=DEFAULT_SETTINGS["seed"],
-        help="Random seed for exact RecBole split reproducibility (default: 42).",
+        help=f"User sampling seed, independent of the RecBole split (default: {DEFAULT_SETTINGS['seed']}).",
     )
+    parser.add_argument("--split_seed", type=int, default=DEFAULT_SPLIT_SEED,
+                        help="RecBole split seed (default: 42).")
+    parser.add_argument("--inference_seed", type=int, default=DEFAULT_INFERENCE_SEED,
+                        help="Generation inference seed (default: 42).")
+    cohorts = parser.add_mutually_exclusive_group()
+    cohorts.add_argument("--cohort_manifest", default=None,
+                         help="Custom frozen-cohort JSON; default: <output_dir>/cohorts/<domain_pair>/users<num_users>.json.")
+    cohorts.add_argument("--independent_sampling", action="store_true",
+                         help="Opt out of frozen cohorts and sample users independently; permits any sampling seed.")
     parser.add_argument(
         "--rating_threshold",
         "-r",
@@ -114,19 +132,20 @@ def parse_args():
         "--prompts_dir",
         type=str,
         default=DEFAULT_SETTINGS["prompts_dir"],
-        help="Directory to save generated prompt files (default: saved_prompts).",
+        help="Prompt output root when saving is enabled (default: saved_prompts).",
     )
+    add_prompt_saving_arguments(parser, DEFAULT_SETTINGS["save_prompts"])
     parser.add_argument(
         "--output_dir",
         type=str,
         default=DEFAULT_SETTINGS["output_dir"],
-        help="Directory to save validation JSON results (default: results).",
+        help="Root for validation reports (default: results_explanations; grouped by domain, seed and generator).",
     )
     parser.add_argument(
         "--sbert_model",
         type=str,
         default=DEFAULT_SETTINGS.get("sbert_model", "BAAI/bge-large-en-v1.5"),
-        help="Sentence-BERT model name for semantic similarity (default: BAAI/bge-large-en-v1.5).",
+        help=f"Sentence-BERT model for semantic similarity (default: {DEFAULT_SETTINGS['sbert_model']}).",
     )
     parser.add_argument(
         "--min_review_words",
@@ -164,16 +183,13 @@ def parse_args():
         default=512,
         help="Maximum sequence length tokens for Sentence-BERT model (default: 512, prevents quadratic VRAM explosion on 8k models).",
     )
-    parser.add_argument(
-        "--no_cache_sbert",
-        action="store_true",
-        help="Disable on-disk caching of reference review embeddings.",
-    )
-    parser.add_argument(
-        "--no_cache_llm",
-        action="store_true",
-        help="Disable loading cached LLM explanations and force fresh generation via Ollama.",
-    )
+    for kind, label in (("sbert", "reference embedding"), ("llm", "explanation")):
+        cache = parser.add_mutually_exclusive_group()
+        cache.add_argument(f"--no_cache_{kind}", dest=f"no_cache_{kind}", action="store_true",
+                           help=f"Disable the {label} cache (default).")
+        cache.add_argument(f"--cache_{kind}", dest=f"no_cache_{kind}", action="store_false",
+                           help=f"Enable the {label} cache.")
+        parser.set_defaults(**{f"no_cache_{kind}": DEFAULT_SETTINGS[f"no_cache_{kind}"]})
     parser.add_argument(
         "--bertscore_model",
         type=str,
@@ -208,7 +224,15 @@ def parse_args():
         action="store_true",
         help="Perform data extraction and prompt generation with mock LLM explanations (dry run).",
     )
-    return normalize_generation_arguments(parser.parse_args())
+    args = normalize_generation_arguments(parser.parse_args())
+    if args.num_users < 1:
+        parser.error("--num_users must be positive")
+    if not args.independent_sampling and args.cohort_manifest is None:
+        args.cohort_manifest = default_manifest_path(args.output_dir, args.domain_pair, args.num_users)
+    if args.cohort_manifest and args.seed not in COHORT_SEEDS:
+        parser.error(f"Frozen cohorts require --seed to be one of {list(COHORT_SEEDS)}; "
+                     "use --independent_sampling for other seeds")
+    return args
 
 
 
@@ -220,7 +244,7 @@ def main():
     from llm_explainer.data_extractor import DataExtractor
     from llm_explainer.quintiles import QuintileManager
 
-    init_seed(args.seed, reproducibility=True)
+    init_seed(args.inference_seed, reproducibility=True)
 
     # 0. Early Validation: Check that the Sentence-BERT model exists and resolves BEFORE running any heavy tasks or Ollama
     try:
@@ -243,7 +267,9 @@ def main():
     print("=" * 80)
     print(f"Domain Pair:         {args.domain_pair}")
     print(f"Number of Users:     {args.num_users}")
-    print(f"Seed:                {args.seed}")
+    print(f"RecBole Split Seed:  {args.split_seed}")
+    print(f"Sampling Seed:       {args.seed}")
+    print(f"Inference Seed:      {args.inference_seed}")
     print(f"Temperature:         {args.temperature}")
     print(f"Rating Threshold:    >= {args.rating_threshold}")
     print(f"Held-out Min Words:  >= {args.min_review_words} words (including title)")
@@ -265,11 +291,13 @@ def main():
     print(f"Context Window:      {args.num_ctx} tokens")
     print(f"Quintile Min Words:  >= {args.min_review_words} words (excluding < {args.min_review_words})")
     print(f"Use Title in Q-Word: {args.use_title_in_quintiles}")
-    print(f"Prompts Directory:   {args.prompts_dir}")
+    print(f"Save Prompts:        {args.save_prompts}")
+    print(f"Prompts Directory:   {args.prompts_dir if args.save_prompts else 'Disabled'}")
     print(f"Output Directory:    {args.output_dir}")
     print("=" * 80)
 
-    os.makedirs(args.prompts_dir, exist_ok=True)
+    if args.save_prompts:
+        os.makedirs(args.prompts_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1. Initialize Ollama client
@@ -277,7 +305,7 @@ def main():
         base_url=args.ollama_url,
         model=args.model,
         temperature=args.temperature,
-        seed=args.seed,
+        seed=args.inference_seed,
         num_ctx=args.num_ctx,
         think=False,
     )
@@ -300,13 +328,18 @@ def main():
 
     # 2.5 Initialize LLM Explanation cache
     cache_prompt_ver = generation_run_version(args.prompt_version, args.generation_mode)
-    expl_cache = ExplanationCache(
-        domain_pair=args.domain_pair,
-        model_name=args.model,
-        prompt_version=cache_prompt_ver,
-        prompt_hash=prompt_metadata["cache_sha256"],
-    )
+    expl_cache = None
     if not args.no_cache_llm:
+        expl_cache = ExplanationCache(
+            domain_pair=args.domain_pair,
+            model_name=args.model,
+            prompt_version=cache_prompt_ver,
+            prompt_hash=prompt_metadata["cache_sha256"],
+            results_dir=args.output_dir,
+            sampling_seed=args.seed,
+            split_seed=args.split_seed,
+            inference_seed=args.inference_seed,
+        )
         logger.info(
             f"LLM Explanation Cache active ({expl_cache.cache_file}): {expl_cache.total_explanations} explanations "
             f"for {expl_cache.total_users} users available on disk."
@@ -321,45 +354,53 @@ def main():
     )
 
     # 4. Extract Data & Splits
-    extractor = DataExtractor(
-        domain_pair=args.domain_pair,
-        seed=args.seed,
-        min_rating=args.rating_threshold,
-        min_held_out_words=args.min_review_words,
-    )
-
-    users_data = extractor.get_users_for_validation(num_users=args.num_users)
+    manifest = None
+    if args.cohort_manifest:
+        settings = cohort_settings(args.domain_pair, args.num_users, args.split_seed,
+                                   args.rating_threshold, args.min_review_words)
+        manifest = load_or_prepare_manifest(args.cohort_manifest, settings)
+        users_data = select_cohort(manifest, args.seed)
+        split_fingerprints = manifest["split_fingerprints"]
+        logger.info("Frozen cohort: %s (SHA-256 %s)", args.cohort_manifest, manifest["sha256"])
+    else:
+        extractor = DataExtractor(
+            domain_pair=args.domain_pair,
+            split_seed=args.split_seed,
+            sampling_seed=args.seed,
+            min_rating=args.rating_threshold,
+            min_held_out_words=args.min_review_words,
+        )
+        users_data = extractor.get_users_for_validation(num_users=args.num_users)
+        split_fingerprints = extractor.split_fingerprints
     if not users_data:
         logger.error("No eligible users found matching all constraints!")
         sys.exit(1)
 
+    # Preparing a new manifest initializes/consumes RecBole RNGs; loading an
+    # existing one does not. Start inference from the same state in both cases.
+    init_seed(args.inference_seed, reproducibility=True)
+
     # Prepare output filenames and dedicated run prompt directory
     # Format: "dominio source"-"dominio target"_"Nome LLM"[_version]_"data e ora"
-    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    clean_model = sanitize_model_name(args.model)
-    clean_version = sanitize_model_name(args.prompt_version) if args.prompt_version else ""
-    is_v1 = not clean_version or clean_version.lower() == "v1"
-    version_suffix = "" if is_v1 else f"_{clean_version}"
-    if args.no_few_shot:
-        version_suffix += "_no_few_shot"
-    elif args.prompt_version == "v3":
-        version_suffix += "_few_shot"
-    model_folder = f"{clean_model}{version_suffix}"
-
-    output_basename = f"{args.domain_pair}_{model_folder}_{run_timestamp}"
+    run_timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_basename = (f"explanations_{readable_model_name(args.model)}"
+                       f"_{args.prompt_version}-{args.generation_mode}_seed-{args.seed}_{run_timestamp}")
+    domain_model_output_dir = explanation_directory(args.output_dir, args.domain_pair, args.seed,
+        args.model, args.prompt_version, args.generation_mode)
+    os.makedirs(domain_model_output_dir, exist_ok=True)
+    output_basename = available_report_basename(output_basename, domain_model_output_dir,
+                                                args.prompts_dir if args.save_prompts else None)
     output_filename = f"{output_basename}.json"
     md_filename = f"{output_basename}.md"
-
-    # Separate results into domain-pair and model/version subfolders (e.g. results/Cloth-Elec/qwen3.5_9b_v2/)
-    domain_model_output_dir = os.path.join(args.output_dir, args.domain_pair, model_folder)
-    os.makedirs(domain_model_output_dir, exist_ok=True)
     output_filepath = os.path.join(domain_model_output_dir, output_filename)
     md_filepath = os.path.join(domain_model_output_dir, md_filename)
 
-    run_prompts_dir = os.path.join(args.prompts_dir, f"prompt_{output_basename}")
-    os.makedirs(run_prompts_dir, exist_ok=True)
-    logger.info(f"Prompts for this run will be saved in: {run_prompts_dir}")
-    if prompt_metadata["template_file"]:
+    run_prompts_dir = None
+    if args.save_prompts:
+        run_prompts_dir = os.path.join(args.prompts_dir, f"prompt_{output_basename}")
+        os.makedirs(run_prompts_dir, exist_ok=True)
+        logger.info(f"Prompts for this run will be saved in: {run_prompts_dir}")
+    if run_prompts_dir and prompt_metadata["template_file"]:
         # Archive the exact template as well as the per-item rendered user prompts.
         with open(prompt_metadata["template_file"], "r", encoding="utf-8") as source:
             template_text = source.read()
@@ -397,17 +438,18 @@ def main():
 
         expl_map = {}
         prompt_files_map = {}
+        prompt_hashes_map = {}
 
         if cached_expls is not None:
             logger.info(
                 f"  [LLM Cache Hit] Reusing {len(cached_expls)} pre-computed explanations for user {uid}."
             )
             expl_map = cached_expls
-            # Ensure prompt files exist for cached items
+            # Rebuild prompts for provenance; persist them only when requested.
             for held_it in user["held_out_items"]:
                 iid = held_it["item_id"]
                 target_item_dict = {"item_id": iid, "item_title": held_it["item_title"]}
-                _, p_file = build_item_prompt(
+                prompt_text, p_file = build_item_prompt(
                     user_id=uid,
                     source_domain_name=user["source_domain"],
                     target_domain_name=user["target_domain"],
@@ -418,8 +460,10 @@ def main():
                     prompt_version=args.prompt_version,
                     include_few_shots=not args.no_few_shot,
                     generation_mode=args.generation_mode,
+                    save_prompts=args.save_prompts,
                 )
                 prompt_files_map[iid] = p_file
+                prompt_hashes_map[iid] = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
         else:
             logger.info(f"  Generating explanations with {args.model} item-by-item...")
             generated_list = []
@@ -439,8 +483,10 @@ def main():
                     prompt_version=args.prompt_version,
                     include_few_shots=not args.no_few_shot,
                     generation_mode=args.generation_mode,
+                    save_prompts=args.save_prompts,
                 )
                 prompt_files_map[iid] = p_file
+                prompt_hashes_map[iid] = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
 
                 try:
                     res_dict = ollama_client.generate_explanation(
@@ -481,7 +527,7 @@ def main():
             ground_truth_text = held_it["ground_truth_review"]
             ground_truth_title = held_it.get("ground_truth_title", "")
             explanation = expl_map.get(iid, "")
-            item_prompt_file = prompt_files_map.get(iid, "")
+            item_prompt_file = prompt_files_map.get(iid)
 
             if not explanation:
                 logger.warning(f"  No explanation returned by LLM for item {iid}!")
@@ -516,8 +562,7 @@ def main():
             global_r2_scores.append(metrics["rouge2_f1"])
             global_rl_scores.append(metrics["rougeL_f1"])
 
-            with open(item_prompt_file, encoding="utf-8") as prompt_handle:
-                item_prompt_hash = hashlib.sha256(prompt_handle.read().encode("utf-8")).hexdigest()
+            item_prompt_hash = prompt_hashes_map[iid]
             item_record = {
                 "id_item": iid,
                 "item_title": title,
@@ -548,7 +593,8 @@ def main():
         avg_r2 = round(sum(user_r2) / len(user_r2), 4) if user_r2 else 0.0
         avg_rl = round(sum(user_rl) / len(user_rl), 4) if user_rl else 0.0
 
-        user_prompt_files = [prompt_files_map[it["item_id"]] for it in user["held_out_items"] if it["item_id"] in prompt_files_map]
+        user_prompt_files = [prompt_files_map[it["item_id"]] for it in user["held_out_items"]
+                             if prompt_files_map.get(it["item_id"])]
         user_result = {
             "user_id": uid,
             "prompt_file": user_prompt_files[0] if user_prompt_files else run_prompts_dir,
@@ -573,7 +619,7 @@ def main():
         )
 
     # Save any newly generated explanations to disk cache
-    if expl_cache.is_dirty and not args.no_cache_llm:
+    if not args.no_cache_llm and expl_cache.is_dirty:
         expl_cache.save()
 
     # 5.5 Free GPU VRAM: Unload LLM from Ollama and clear GPU memory
@@ -808,6 +854,13 @@ def main():
         "bertscore_model": args.bertscore_model if not args.no_bertscore else None,
         "bertscore_rescale_with_baseline": args.bertscore_rescale_baseline if not args.no_bertscore else None,
         "seed": args.seed,
+        "split_seed": args.split_seed,
+        "sampling_seed": args.seed,
+        "inference_seed": args.inference_seed,
+        "split_fingerprints": split_fingerprints,
+        "cohort_manifest": os.path.abspath(args.cohort_manifest) if args.cohort_manifest else None,
+        "cohort_sha256": manifest["sha256"] if manifest else None,
+        "selected_user_ids": [user["user_id"] for user in users_data],
         "temperature": args.temperature,
         "rating_threshold": args.rating_threshold,
         "min_review_words": args.min_review_words,
@@ -815,6 +868,7 @@ def main():
         "num_users": len(users_data),
         "total_held_out_items_evaluated": len(global_bleu_scores),
         "prompts_dir": run_prompts_dir,
+        "save_prompts": args.save_prompts,
         "users": all_user_results,
         "global_averages": global_averages_dict,
         "quintile_metrics": quintile_metrics,
@@ -845,7 +899,7 @@ def main():
         print(f"Macro Average BERTScore (Prec):  {macro_bert_p:.4f}")
     print(f"Saved Results JSON:              {output_filepath}")
     print(f"Saved Results Markdown:          {md_filepath}")
-    print(f"Saved Prompts Directory:         {run_prompts_dir}")
+    print(f"Saved Prompts Directory:         {run_prompts_dir or 'Disabled (--no_save_prompts)'}")
     print("=" * 95)
 
     print("\n" + "=" * 105)

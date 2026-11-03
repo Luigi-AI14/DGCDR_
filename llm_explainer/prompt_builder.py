@@ -1,7 +1,7 @@
 """
 Prompt builder module for generating LLM explanation prompts in English.
 Formats user history across domains, presents a single recommended item from DGCDR,
-enforces JSON response schema, and saves each prompt to a dedicated file.
+enforces JSON response schema, and optionally saves each prompt to a dedicated file.
 """
 
 import hashlib
@@ -37,6 +37,15 @@ def add_generation_mode_arguments(parser, no_few_shot_default=False):
         "--no_few_shot", action="store_true", default=no_few_shot_default,
         help="Compatibility alias for --generation_mode zero-shot.",
     )
+
+
+def add_prompt_saving_arguments(parser, default=False):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--save_prompts", dest="save_prompts", action="store_true",
+                       help="Enable saving generation prompts and the template snapshot.")
+    group.add_argument("--no_save_prompts", dest="save_prompts", action="store_false",
+                       help="Do not write files to saved_prompts (default).")
+    parser.set_defaults(save_prompts=default)
 
 
 def normalize_generation_arguments(args):
@@ -212,15 +221,18 @@ def build_item_prompt(
     prompt_version: str = DEFAULT_PROMPT_VERSION,
     include_few_shots: Optional[bool] = None,
     generation_mode: Optional[str] = None,
+    save_prompts: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """
     Builds a single-item prompt using v3 (file template) or legacy v2.
     V3 selects a separate evidence-demonstration template for few-shot generation.
-    Saves the prompt text to prompts_dir/prompt_<user_id>_<item_id>.txt if prompts_dir is provided.
+    Saves prompt text only when prompts_dir is provided and save_prompts is True.
 
     Returns:
         (prompt_text, saved_file_path)
     """
+    if not save_prompts:
+        prompts_dir = None
     if generation_mode is None and include_few_shots is not None:
         generation_mode = "few-shot" if include_few_shots else "zero-shot"
     mode = resolve_generation_mode(prompt_version, generation_mode)
@@ -380,18 +392,7 @@ def build_item_prompt(
 
     prompt_text = "\n".join(lines)
 
-    # Save prompt to file if directory is specified
-    saved_path = None
-    if prompts_dir:
-        os.makedirs(prompts_dir, exist_ok=True)
-        # Clean identifiers for safe filename
-        safe_uid = "".join(c for c in str(user_id) if c.isalnum() or c in ("-", "_"))
-        safe_iid = "".join(c for c in str(target_item["item_id"]) if c.isalnum() or c in ("-", "_"))
-        saved_path = os.path.join(prompts_dir, f"prompt_{safe_uid}_{safe_iid}.txt")
-        with open(saved_path, "w", encoding="utf-8") as f:
-            f.write(prompt_text)
-
-    return prompt_text, saved_path
+    return prompt_text, _save_prompt(prompt_text, prompts_dir, user_id, target_item["item_id"])
 
 
 def build_user_prompt(
@@ -405,6 +406,7 @@ def build_user_prompt(
     prompt_version: str = DEFAULT_PROMPT_VERSION,
     include_few_shots: Optional[bool] = None,
     generation_mode: Optional[str] = None,
+    save_prompts: bool = True,
 ) -> Tuple[str, Optional[str]]:
     """
     Backward-compatibility wrapper for build_item_prompt.
@@ -422,5 +424,6 @@ def build_user_prompt(
             prompt_version=prompt_version,
             include_few_shots=include_few_shots,
             generation_mode=generation_mode,
+            save_prompts=save_prompts,
         )
     return "", None

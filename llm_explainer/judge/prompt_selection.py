@@ -1,6 +1,7 @@
 """Shared selection of the two judge prompt variants."""
 
 import os
+from llm_explainer.config import JUDGE_DEFAULTS
 
 
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
@@ -13,7 +14,7 @@ JUDGE_PROMPTS = {
 def add_judge_prompt_arguments(parser):
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
-        "--judge_prompt", choices=tuple(JUDGE_PROMPTS), default="zero-shot",
+        "--judge_prompt", choices=tuple(JUDGE_PROMPTS), default=JUDGE_DEFAULTS["judge_prompt"],
         help="Judge prompt variant (default: zero-shot).",
     )
     group.add_argument(

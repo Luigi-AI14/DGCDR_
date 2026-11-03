@@ -32,6 +32,22 @@ def sanitize_model_name(model_name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9._-]', '_', cleaned)
 
 
+def readable_model_name(model_name: str) -> str:
+    """Use hyphens within model names and underscores between filename fields."""
+    return sanitize_model_name(model_name.replace(":", "-").replace("/", "-"))
+
+
+def available_report_basename(basename: str, output_dir: str, prompts_dir: Optional[str] = None) -> str:
+    """Keep readable timestamps; add _2, _3, etc. only for an existing run."""
+    candidate = basename
+    number = 2
+    while (any(os.path.exists(os.path.join(output_dir, candidate + ext)) for ext in (".json", ".md"))
+           or (prompts_dir is not None and os.path.exists(os.path.join(prompts_dir, "prompt_" + candidate)))):
+        candidate = f"{basename}_{number}"
+        number += 1
+    return candidate
+
+
 def _format_blockquote(text: str) -> str:
     """Formats a text block as a Markdown blockquote, ensuring each line has '>'."""
     if not text:
@@ -59,7 +75,7 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
     users = data.get("users", [])
     num_users = data.get("num_users", len(users))
     total_held_out = data.get("total_held_out_items_evaluated", sum(len(u.get("items", [])) for u in users))
-    prompts_dir = data.get("prompts_dir", "N/A")
+    prompts_dir = data.get("prompts_dir") or ("Not saved" if data.get("save_prompts") is False else "N/A")
 
     global_avg = data.get("global_averages", {})
     quintile_metrics = data.get("quintile_metrics", {})
@@ -102,10 +118,16 @@ def json_to_markdown(data: Dict[str, Any]) -> str:
         rescale_str = " (Rescaled with Baseline)" if rescale_baseline else " (Raw)"
         md.append(f"| **BERTScore Model** | `{bertscore_model}`{rescale_str} |")
     md.append(f"| **Random Seed** | `{seed}` |")
+    for key, label in (("split_seed", "RecBole Split Seed"), ("sampling_seed", "User Sampling Seed"),
+                       ("inference_seed", "Inference Seed"), ("cohort_manifest", "Frozen Cohorts")):
+        if data.get(key) is not None:
+            md.append(f"| **{label}** | `{data[key]}` |")
     md.append(f"| **Sampling Temperature** | `{temp}` |")
     md.append(f"| **Rating Threshold** | `&ge; {threshold}` |")
     md.append(f"| **Quintile Min Words Filter** | `&ge; {min_review_words} words` |")
     md.append(f"| **Prompts Directory** | `{prompts_dir}` |")
+    if "save_prompts" in data:
+        md.append(f"| **Save Generation Prompts** | `{'Enabled' if data['save_prompts'] else 'Disabled'}` |")
     md.append("")
 
     # Global Performance Metrics
@@ -307,6 +329,9 @@ def generate_markdown_report(report_data: Dict[str, Any], md_filepath: str) -> s
 
 def export_json_to_markdown(json_path: str, md_path: Optional[str] = None) -> str:
     """Reads a JSON validation file and exports it to a companion Markdown file."""
+    from llm_explainer.result_paths import resolve_result_reference
+    from llm_explainer.config import BASE_DIR
+    json_path = resolve_result_reference(json_path, BASE_DIR)
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -318,7 +343,7 @@ def export_json_to_markdown(json_path: str, md_path: Optional[str] = None) -> st
 
 
 def reorganize_and_convert_legacy_results(
-    results_dir: str = "results",
+    results_dir: str = "results_explanations",
     move_files: bool = False,
 ) -> List[Dict[str, str]]:
     """
@@ -387,7 +412,7 @@ def reorganize_and_convert_legacy_results(
     return migrated
 
 
-def organize_domain_folders_by_model(results_dir: str = "results") -> int:
+def organize_domain_folders_by_model(results_dir: str = "results_explanations") -> int:
     """
     Checks domain folders (e.g. results/Cloth-Elec/) and moves any direct
     .json and .md files into model subfolders (e.g. results/Cloth-Elec/llama3.1_8b/).
@@ -439,8 +464,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--results_dir",
         type=str,
-        default="results",
-        help="Path to results directory (default: results).",
+        default="results_explanations",
+        help="Path to explanation results (default: results_explanations).",
     )
     parser.add_argument(
         "--file",

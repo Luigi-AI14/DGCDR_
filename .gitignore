@@ -15,5 +15,8 @@ scratch_geval_text.txt
 results
 /saved_prompts
 /results_judge
+/results_explanations
+/results_judge_shuffled
+/legacy_results
 /plots
-/results_semantic_shuffled 
+/results_semantic_shuffled

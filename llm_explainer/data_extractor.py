@@ -20,6 +20,7 @@ from recbole_cdr.config import CDRConfig
 from recbole_cdr.data import create_dataset
 
 from llm_explainer.config import BASE_DIR, DOMAIN_CONFIGS
+from llm_explainer.cohorts import fingerprint_splits
 from llm_explainer.quintiles import count_words
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,9 @@ class DataExtractor:
         min_rating: float = 4.0,
         min_held_out_words: int = 5,
         cache_dir: Optional[str] = None,
+        *,
+        split_seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
     ):
         if domain_pair not in DOMAIN_CONFIGS:
             raise ValueError(f"Unknown domain pair: {domain_pair}. Available: {list(DOMAIN_CONFIGS.keys())}")
@@ -57,6 +61,9 @@ class DataExtractor:
         self.domain_pair = domain_pair
         self.config_info = DOMAIN_CONFIGS[domain_pair]
         self.seed = seed
+        # Legacy callers (including the leakage audit) retain seed's old behavior.
+        self.split_seed = seed if split_seed is None else split_seed
+        self.sampling_seed = seed if sampling_seed is None else sampling_seed
         self.min_rating = min_rating
         self.min_held_out_words = min_held_out_words
         self.cache_dir = cache_dir or os.path.join(BASE_DIR, "cache")
@@ -75,13 +82,13 @@ class DataExtractor:
             user_target_history: dict user_id -> list of target items (80% train+valid)
             user_target_test: dict user_id -> list of target test items (20% held-out)
         """
-        logger.info(f"Loading RecBole dataset for {self.domain_pair} with seed {self.seed}...")
+        logger.info(f"Loading RecBole dataset for {self.domain_pair} with split seed {self.split_seed}...")
         config = CDRConfig(
             model="DGCDR",
             config_file_list=self.config_info["config_file_list"],
-            config_dict={"seed": self.seed},
+            config_dict={"seed": self.split_seed},
         )
-        init_seed(self.seed, config["reproducibility"])
+        init_seed(self.split_seed, config["reproducibility"])
         dataset = create_dataset(config)
         built = dataset.build()
 
@@ -125,6 +132,7 @@ class DataExtractor:
             f"{len(user_target_history)} target history users, "
             f"{len(user_target_test)} target test users."
         )
+        self.split_fingerprints = fingerprint_splits(user_source_all, user_target_history, user_target_test)
         return user_source_all, user_target_history, user_target_test
 
     def extract_metadata_for_users(
@@ -346,7 +354,7 @@ class DataExtractor:
                 "(TIP: Run 'python preprocess_compact_data.py' once for instant sub-second loading!)"
             )
             # Take a uniform candidate pool across overlapping users to avoid bias towards initial alphabetical users
-            rng_pool = random.Random(self.seed)
+            rng_pool = random.Random(self.sampling_seed)
             pool_size = min(len(overlapping_uids), max(num_users * 5, 50))
             pool_uids = set(rng_pool.sample(overlapping_uids, k=pool_size))
 
@@ -447,7 +455,7 @@ class DataExtractor:
             )
             selected_users = all_valid_users
         else:
-            rng = random.Random(self.seed)
+            rng = random.Random(self.sampling_seed)
             selected_users = rng.sample(all_valid_users, k=num_users)
 
         # Sort selected users by user_id for deterministic and organized logging / output files
@@ -455,6 +463,6 @@ class DataExtractor:
 
         logger.info(
             f"Successfully sampled {len(selected_users)} users from uniform distribution "
-            f"(out of {total_eligible} eligible, seed={self.seed})."
+            f"(out of {total_eligible} eligible, sampling_seed={self.sampling_seed})."
         )
         return selected_users

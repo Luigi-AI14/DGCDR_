@@ -33,8 +33,8 @@ Usage:
   # 2. Generate and immediately run LLM Judge test on 5 users
   python shuffle_for_judge.py --run_judge --max_users 5
 
-  # 3. Generate and run full LLM Judge evaluation
-  python shuffle_for_judge.py --run_judge
+  # 3. Generate and judge all users (default judge limit is 200)
+  python shuffle_for_judge.py --run_judge --all_users
 
   # 4. Compare congruent vs shuffled evaluation reports
   python shuffle_for_judge.py --compare --auto
@@ -76,9 +76,49 @@ if BASE_DIR not in sys.path:
 
 from llm_explainer.judge.markdown_report import score_distribution_markdown
 from llm_explainer.judge.prompt_selection import add_judge_prompt_arguments, resolve_judge_prompt
+from llm_explainer.markdown_exporter import (
+    readable_model_name, sanitize_model_name, available_report_basename,
+)
+from llm_explainer.result_paths import (
+    EXPLANATIONS_ROOT, SHUFFLED_JUDGE_ROOT, explanation_directory, judge_directory, resolve_result_reference,
+)
+from llm_explainer.config import JUDGE_DEFAULTS
 
-DEFAULT_RESULTS_DIR = os.path.join(BASE_DIR, "results")
+DEFAULT_RESULTS_DIR = os.path.join(BASE_DIR, EXPLANATIONS_ROOT)
 DEFAULT_JUDGE_RESULTS_DIR = os.path.join(BASE_DIR, "results_judge")
+
+COMPARISON_FIELDS = (
+    "judge_protocol", "judge_prompt_version", "system_prompt_sha256", "instance_prompt_sha256", "model",
+    "weighted_scoring", "top_logprobs", "generator_model", "split_seed", "sampling_seed", "cohort_sha256",
+)
+
+
+def read_report(path):
+    try:
+        path = resolve_result_reference(path, BASE_DIR)
+        with open(path, encoding="utf-8") as handle:
+            report = json.load(handle)
+        return report if isinstance(report, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def comparison_difference(congruent, shuffled):
+    """Match report contents, independent of legacy or readable filenames."""
+    for field in COMPARISON_FIELDS:
+        if congruent.get("metadata", {}).get(field) != shuffled.get("metadata", {}).get(field):
+            return field
+    for field in ("split_seed", "sampling_seed"):
+        if congruent.get(field) != shuffled.get(field):
+            return field
+    original = shuffled.get("shuffle_info", {}).get("source_file")
+    source = congruent.get("metadata", {}).get("source_results")
+    if original and source:
+        def resolved(path):
+            return os.path.normcase(resolve_result_reference(path, BASE_DIR))
+        if resolved(original) != resolved(source):
+            return "source_results"
+    return None
 
 
 # ==============================================================================
@@ -94,60 +134,64 @@ def find_latest_results_file(
     pattern = os.path.join(results_dir, "**", "*.json")
     all_files = glob.glob(pattern, recursive=True)
 
-    candidates = []
-    for f in all_files:
+    for f in sorted(all_files, key=os.path.getmtime, reverse=True):
         norm = os.path.normpath(f)
         bname = os.path.basename(f)
         if bname.startswith("compact_") or "_legacy_archive" in norm or "verification" in norm or "shuffled" in norm:
             continue
-        if domain_pair and domain_pair not in norm:
+        report = read_report(f)
+        if not report or report.get("is_shuffled") or not report.get("model") or not isinstance(report.get("users"), list):
             continue
-        if model_name and model_name not in norm:
+        if domain_pair and report.get("domain_pair") != domain_pair:
             continue
-        candidates.append(f)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    return candidates[0]
+        recorded_model = report["model"]
+        if model_name and model_name not in (recorded_model, sanitize_model_name(recorded_model), readable_model_name(recorded_model)):
+            continue
+        return f
+    return None
 
 
 def find_latest_eval_files(
     judge_dir: str = DEFAULT_JUDGE_RESULTS_DIR,
     domain_pair: str = "Cloth-Elec",
+    congruent_path: Optional[str] = None,
+    shuffled_path: Optional[str] = None,
+    shuffled_judge_dir: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Finds the latest congruent and latest shuffled evaluation JSON files.
+    Finds the latest compatible congruent/shuffled pair, including nested folders.
     Returns (latest_congruent_file, latest_shuffled_file).
     """
-    pattern = os.path.join(judge_dir, domain_pair, "*.json")
-    all_files = glob.glob(pattern)
+    if shuffled_judge_dir is None:
+        shuffled_judge_dir = os.path.join(os.path.dirname(os.path.abspath(judge_dir)), SHUFFLED_JUDGE_ROOT)
+    all_files = set()
+    for root in (judge_dir, shuffled_judge_dir):
+        all_files.update(glob.glob(os.path.join(root, domain_pair, "**", "*.json"), recursive=True))
+    congruent_path = resolve_result_reference(congruent_path, BASE_DIR) if congruent_path else None
+    shuffled_path = resolve_result_reference(shuffled_path, BASE_DIR) if shuffled_path else None
+    all_files.update(path for path in (congruent_path, shuffled_path) if path and os.path.isfile(path))
 
     congruent_files = []
     shuffled_files = []
 
-    for f in all_files:
-        bname = os.path.basename(f)
-        if bname.startswith("benchmark_"):
+    for f in sorted(all_files, key=os.path.getmtime, reverse=True):
+        report = read_report(f)
+        if not report or "global_mean_score" not in report or not isinstance(report.get("metadata"), dict):
             continue
-        if "_shuffled_" in bname or "_shuffled" in bname:
-            shuffled_files.append(f)
+        # Pairing only needs provenance; do not retain every user's judge trace.
+        report = {key: report[key] for key in ("metadata", "split_seed", "sampling_seed", "shuffle_info", "is_shuffled")
+                  if key in report}
+        if report.get("is_shuffled", "_shuffled" in os.path.basename(f)):
+            if shuffled_path is None or os.path.abspath(f) == os.path.abspath(shuffled_path):
+                shuffled_files.append((f, report))
         else:
-            congruent_files.append(f)
-
-    latest_cong = None
-    latest_shuf = None
-
-    if congruent_files:
-        congruent_files.sort(key=os.path.getmtime, reverse=True)
-        latest_cong = congruent_files[0]
-
-    if shuffled_files:
-        shuffled_files.sort(key=os.path.getmtime, reverse=True)
-        latest_shuf = shuffled_files[0]
-
-    return latest_cong, latest_shuf
+            if congruent_path is None or os.path.abspath(f) == os.path.abspath(congruent_path):
+                congruent_files.append((f, report))
+    for shuf_path, shuffled in shuffled_files:
+        for cong_path, congruent in congruent_files:
+            if comparison_difference(congruent, shuffled) is None:
+                return cong_path, shuf_path
+    return None, None
 
 
 # ==============================================================================
@@ -324,6 +368,7 @@ def create_shuffled_dataset(
     Generates the randomized baseline dataset and companion Markdown info card.
     Returns (json_output_path, md_info_path, stats_dict).
     """
+    source_results_path = resolve_result_reference(source_results_path, BASE_DIR)
     if not os.path.exists(source_results_path):
         raise FileNotFoundError(f"Source results file not found: {source_results_path}")
 
@@ -392,7 +437,7 @@ def create_shuffled_dataset(
 
     # Deep copy source data to construct shuffled dataset
     shuffled_data = json.loads(json.dumps(source_data))
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     # Inject shuffled explanations and metadata into items
     for i, j in enumerate(assignment):
@@ -427,15 +472,24 @@ def create_shuffled_dataset(
 
     # Resolve output directory & path
     if output_dir is None:
-        output_dir = os.path.join(DEFAULT_RESULTS_DIR, domain_pair, "shuffled")
+        mode_name = source_data.get("generation_mode") or ("zero-shot" if source_data.get("no_few_shot") else "few-shot")
+        if source_data.get("sampling_seed") is not None:
+            output_dir = os.path.join(explanation_directory(DEFAULT_RESULTS_DIR, domain_pair,
+                source_data["sampling_seed"], model_name, source_data.get("prompt_version", "legacy"), mode_name), "shuffled")
+        else:
+            output_dir = os.path.join(DEFAULT_RESULTS_DIR, domain_pair, "shuffled")
     os.makedirs(output_dir, exist_ok=True)
 
     if output_path is None:
-        clean_model = model_name.replace(":", "_").replace("/", "_")
-        filename = f"{domain_pair}_{clean_model}_shuffled_{mode}_seed{seed}_{now_str}.json"
-        output_path = os.path.join(output_dir, filename)
+        version = source_data.get("prompt_version", "legacy")
+        generation_mode = source_data.get("generation_mode") or ("zero-shot" if source_data.get("no_few_shot") else "few-shot")
+        cohort_tag = f"_seed-{source_data['sampling_seed']}" if source_data.get("sampling_seed") is not None else ""
+        basename = (f"explanations_{readable_model_name(model_name)}_{version}-{generation_mode}"
+                    f"_shuffled-{mode.replace('_', '-')}{cohort_tag}_shuffle-seed-{seed}_{now_str}")
+        basename = available_report_basename(basename, output_dir)
+        output_path = os.path.join(output_dir, basename + ".json")
 
-    info_path = os.path.splitext(output_path)[0] + "_info.md"
+    info_path = os.path.splitext(output_path)[0] + ".md"
 
     # Save JSON dataset
     with open(output_path, "w", encoding="utf-8") as f:
@@ -452,6 +506,8 @@ def create_shuffled_dataset(
         f"- **Model Origin**: `{model_name}`",
         f"- **Shuffle Mode**: `{mode}`",
         f"- **Random Seed**: `{seed}`",
+        f"- **User Sampling Seed**: `{source_data.get('sampling_seed', 'N/A')}`",
+        f"- **RecBole Split Seed**: `{source_data.get('split_seed', 'N/A')}`",
         f"- **Total Shuffled Items**: {n_items}",
         f"- **Self Collisions**: {self_collisions}",
         f"- **Same-Item Collisions**: {same_item_collisions}",
@@ -497,12 +553,12 @@ def create_shuffled_dataset(
 
 def run_judge_evaluation(
     shuffled_dataset_path: str,
-    num_users: Optional[int] = None,
-    model: str = "llama3.1:8b",
+    num_users: Optional[int] = JUDGE_DEFAULTS["num_users"],
+    model: str = JUDGE_DEFAULTS["model"],
     temperature: float = 0.0,
     seed: int = 42,
     ollama_url: str = "http://localhost:11434",
-    output_dir: str = "results_judge/Cloth-Elec",
+    output_dir: Optional[str] = None,
     top_logprobs: int = 20,
     no_weighted_scoring: bool = False,
     num_gpu: Optional[int] = None,
@@ -510,6 +566,9 @@ def run_judge_evaluation(
     system_prompt: Optional[str] = None,
 ) -> int:
     """Runs test_geval_prompts.py on the shuffled dataset using the active Python interpreter."""
+    if output_dir is None:
+        source = read_report(shuffled_dataset_path) or {}
+        output_dir = judge_directory(BASE_DIR, source, shuffled=True)
     cmd = [
         sys.executable,
         os.path.join(BASE_DIR, "llm_explainer", "judge", "test_geval_prompts.py"),
@@ -527,6 +586,8 @@ def run_judge_evaluation(
         cmd.extend(["--num_gpu", str(num_gpu)])
     if num_users is not None:
         cmd.extend(["--num_users", str(num_users)])
+    else:
+        cmd.append("--all_users")
     if system_prompt:
         cmd.extend(["--system_prompt", system_prompt])
     else:
@@ -614,18 +675,17 @@ def compare_congruent_vs_shuffled(
     Computes contrastive margins, discriminative win rate, score distributions,
     hypothesis tests, and quintile breakdown.
     """
+    congruent_path = resolve_result_reference(congruent_path, BASE_DIR)
+    shuffled_path = resolve_result_reference(shuffled_path, BASE_DIR)
     with open(congruent_path, "r", encoding="utf-8") as f:
         cong_data = json.load(f)
     with open(shuffled_path, "r", encoding="utf-8") as f:
         shuf_data = json.load(f)
 
     # Never silently compare different rubric/protocol conditions.
-    for field in ("judge_protocol", "judge_prompt_version", "system_prompt_sha256", "instance_prompt_sha256", "model",
-                  "weighted_scoring", "top_logprobs"):
-        c_value = cong_data.get("metadata", {}).get(field)
-        s_value = shuf_data.get("metadata", {}).get(field)
-        if c_value != s_value:
-            raise ValueError("Incompatible judge reports: different " + field)
+    difference = comparison_difference(cong_data, shuf_data)
+    if difference is not None:
+        raise ValueError("Incompatible judge reports: different " + difference)
 
     # Build lookup table for shuffled items: (user_id, item_id) -> item_data
     shuf_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -729,10 +789,12 @@ def compare_congruent_vs_shuffled(
             }
 
     # Summary
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     report_dict = {
         "timestamp": datetime.datetime.now().isoformat(),
         "judge_prompt_version": cong_data.get("metadata", {}).get("judge_prompt_version", "unknown"),
+        "split_seed": cong_data.get("split_seed"),
+        "sampling_seed": cong_data.get("sampling_seed"),
         "congruent_file": congruent_path,
         "shuffled_file": shuffled_path,
         "matched_items": n_matched,
@@ -777,8 +839,9 @@ def compare_congruent_vs_shuffled(
         output_dir = os.path.dirname(congruent_path)
     os.makedirs(output_dir, exist_ok=True)
 
-    json_report_path = os.path.join(output_dir, f"benchmark_judge_congruent_vs_shuffled_{now_str}.json")
-    md_report_path = os.path.join(output_dir, f"benchmark_judge_congruent_vs_shuffled_{now_str}.md")
+    basename = available_report_basename(f"benchmark_judge_congruent_vs_shuffled_{now_str}", output_dir)
+    json_report_path = os.path.join(output_dir, basename + ".json")
+    md_report_path = os.path.join(output_dir, basename + ".md")
 
     with open(json_report_path, "w", encoding="utf-8") as f:
         json.dump(report_dict, f, indent=2, ensure_ascii=False)
@@ -896,13 +959,13 @@ def parse_args():
         "--results_file",
         "-f",
         type=str,
-        default="results/Cloth-Elec/llama3.1_8b_v2/Cloth-Elec_llama3.1_8b_v2_20260930_164711.json",
-        help="Path to results JSON file to shuffle. If omitted and --latest is set, automatically finds newest.",
+        default=None,
+        help="Explanation JSON to shuffle; provide this or --latest. Archived paths are supported.",
     )
     parser.add_argument(
         "--latest",
         action="store_true",
-        help="Automatically pick the latest results JSON file in results/.",
+        help="Automatically pick the latest explanation JSON in results_explanations/.",
     )
     parser.add_argument(
         "--mode",
@@ -928,7 +991,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default=None,
-        help="Directory to save shuffled dataset files (default: results/<domain_pair>/shuffled).",
+        help="Custom shuffled-dataset directory (default: results_explanations/<domain>/seed<seed>/<generator>/shuffled).",
     )
     parser.add_argument(
         "--min_words",
@@ -945,18 +1008,21 @@ def parse_args():
         action="store_true",
         help="Automatically launch LLM Judge (test_geval_prompts.py) on the generated shuffled dataset.",
     )
-    parser.add_argument(
+    users = parser.add_mutually_exclusive_group()
+    users.add_argument(
         "--num_users",
         "--max_users",
         type=int,
-        default=None,
-        help="Number of users to evaluate when running judge (e.g. 5 for quick test, default: all).",
+        default=JUDGE_DEFAULTS["num_users"],
+        help=f"Number of users to evaluate when running judge (default: {JUDGE_DEFAULTS['num_users']}).",
     )
+    users.add_argument("--all_users", dest="num_users", action="store_const", const=None,
+                       help="Judge all users in the shuffled report.")
     parser.add_argument(
         "--model",
         type=str,
-        default="llama3.1:8b",
-        help="LLM Judge model (default: llama3.1:8b).",
+        default=JUDGE_DEFAULTS["model"],
+        help=f"LLM Judge model (default: {JUDGE_DEFAULTS['model']}).",
     )
     parser.add_argument(
         "--temperature",
@@ -990,12 +1056,12 @@ def parse_args():
         "--shuffled_eval",
         type=str,
         default=None,
-        help="Path to shuffled evaluation JSON file in results_judge/.",
+        help="Path to shuffled evaluation JSON file in results_judge_shuffled/.",
     )
     parser.add_argument(
         "--auto_compare",
         action="store_true",
-        help="Automatically find latest congruent and shuffled evaluation files in results_judge/.",
+        help="Find a compatible pair across results_judge/ and results_judge_shuffled/.",
     )
 
     return parser.parse_args()
@@ -1006,12 +1072,12 @@ def main():
 
     # Mode 1: Benchmark comparison between evaluation runs
     if args.compare or args.auto_compare:
-        cong_file = args.congruent_eval
-        shuf_file = args.shuffled_eval
+        cong_file = resolve_result_reference(args.congruent_eval, BASE_DIR) if args.congruent_eval else None
+        shuf_file = resolve_result_reference(args.shuffled_eval, BASE_DIR) if args.shuffled_eval else None
 
         if args.auto_compare or not (cong_file and shuf_file):
-            logger.info("Auto-detecting latest evaluation runs in results_judge/Cloth-Elec/...")
-            latest_c, latest_s = find_latest_eval_files()
+            logger.info("Finding compatible reports in results_judge/ and results_judge_shuffled/...")
+            latest_c, latest_s = find_latest_eval_files(congruent_path=cong_file, shuffled_path=shuf_file)
             if not cong_file:
                 cong_file = latest_c
             if not shuf_file:
@@ -1035,7 +1101,9 @@ def main():
         if latest:
             source_file = latest
 
-    if not os.path.exists(source_file):
+    if source_file:
+        source_file = resolve_result_reference(source_file, BASE_DIR)
+    if not source_file or not os.path.exists(source_file):
         logger.error(f"Source results file not found: {source_file}")
         sys.exit(1)
 

@@ -5,6 +5,7 @@ re-running time-consuming LLM generation when prompts and temperature (0.0) are 
 """
 
 import json
+import glob
 import logging
 import os
 import pickle
@@ -12,6 +13,7 @@ import re
 from typing import Dict, List, Optional
 
 from llm_explainer.config import BASE_DIR
+from llm_explainer.result_paths import EXPLANATIONS_ROOT, generator_folder
 from llm_explainer.markdown_exporter import sanitize_model_name
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,9 @@ class ExplanationCache:
         cache_dir: Optional[str] = None,
         results_dir: Optional[str] = None,
         prompt_hash: Optional[str] = None,
+        sampling_seed: Optional[int] = None,
+        split_seed: Optional[int] = None,
+        inference_seed: Optional[int] = None,
     ):
         self.domain_pair = domain_pair
         self.model_name = model_name
@@ -40,7 +45,10 @@ class ExplanationCache:
         self.clean_version = sanitize_model_name(self.prompt_version) if self.prompt_version else ""
         self.is_v1 = not self.clean_version or self.clean_version.lower() == "v1"
         self.cache_dir = cache_dir or os.path.join(BASE_DIR, "cache", "explanations")
-        self.results_dir = results_dir or os.path.join(BASE_DIR, "results")
+        self.results_dir = results_dir or os.path.join(BASE_DIR, EXPLANATIONS_ROOT)
+        self.sampling_seed = sampling_seed
+        self.split_seed = split_seed
+        self.inference_seed = inference_seed
         os.makedirs(self.cache_dir, exist_ok=True)
         
         if not self.is_v1:
@@ -54,6 +62,10 @@ class ExplanationCache:
         if self.prompt_hash:
             # Template edits under the same version must not reuse older text.
             self.cache_file = self.cache_file[:-4] + "_" + self.prompt_hash + ".pkl"
+        context = "".join(f"_{label}{value}" for label, value in (
+            ("sample", sampling_seed), ("split", split_seed), ("inference", inference_seed)) if value is not None)
+        if context:
+            self.cache_file = self.cache_file[:-4] + context + ".pkl"
         # Internal store: user_id -> {item_id: explanation_string}
         self._cache: Dict[str, Dict[str, str]] = {}
         self._dirty = False
@@ -80,7 +92,7 @@ class ExplanationCache:
 
     def _auto_import_from_results(self) -> None:
         """
-        Scans previous run results in results/ to pre-populate the cache with existing explanations.
+        Scans the active explanation root to pre-populate the cache with existing explanations.
         Filters strictly for runs with temperature=0.0 and generated on or after 2026-09-28
         matching the specific prompt_version to avoid mixing explanations across prompt versions.
         """
@@ -89,12 +101,20 @@ class ExplanationCache:
         else:
             model_dir = os.path.join(self.results_dir, self.domain_pair, self.clean_model)
 
-        if not os.path.exists(model_dir):
-            return
-
+        version = self.prompt_version
+        mode = "few-shot"
+        for suffix, selected_mode in (("_no_few_shot", "zero-shot"), ("_few_shot", "few-shot")):
+            if version.endswith(suffix):
+                version, mode = version[:-len(suffix)], selected_mode
+                break
+        seed_folder = f"seed{self.sampling_seed}" if self.sampling_seed is not None else "seed*"
+        patterns = [os.path.join(self.results_dir, self.domain_pair, seed_folder,
+                                generator_folder(self.model_name, version, mode), "*.json")]
+        # Callers explicitly pointing at an older/custom root retain flat-layout support.
+        patterns.append(os.path.join(model_dir, "*.json"))
         imported_count = 0
         json_files = sorted(
-            [os.path.join(model_dir, f) for f in os.listdir(model_dir) if f.endswith(".json")],
+            {path for pattern in patterns for path in glob.glob(pattern)},
             key=os.path.getmtime,
             reverse=True,
         )
@@ -102,13 +122,22 @@ class ExplanationCache:
         for jf in json_files:
             fname = os.path.basename(jf)
             # Only consider files from 2026-09-28 onwards (when temperature=0.0 was certified)
-            date_match = re.search(r"(\d{8})_\d{6}", fname)
-            if not date_match or date_match.group(1) < "20260928":
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}", fname)
+            if date_match is None:
+                date_match = re.search(r"(\d{8})_\d{6}", fname)
+            if not date_match or date_match.group(1).replace("-", "") < "20260928":
                 continue
 
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
+
+                if data.get("is_shuffled"):
+                    continue
+                if any(value is not None and data.get(field) != value for field, value in (
+                    ("sampling_seed", self.sampling_seed), ("split_seed", self.split_seed),
+                    ("inference_seed", self.inference_seed))):
+                    continue
 
                 # Verify deterministic temperature=0.0
                 if data.get("temperature") != 0.0:
@@ -155,7 +184,7 @@ class ExplanationCache:
 
         if imported_count > 0:
             logger.info(
-                f"Auto-imported {imported_count} verified explanations (temp=0.0, prompt_version={self.prompt_version or 'v1'}) from {model_dir}"
+                f"Auto-imported {imported_count} verified explanations (temp=0.0, prompt_version={self.prompt_version or 'v1'}) from {self.results_dir}"
             )
             self.save()
 
