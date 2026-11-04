@@ -14,6 +14,7 @@ python run_transfer_analysis.py \
 """
 import argparse
 import csv
+from dataclasses import asdict
 import json
 import logging
 from pathlib import Path
@@ -26,7 +27,9 @@ from analysis_common import (
     pairs, histories, token_map, token_pairs, token_histories, checkpoint_config,
     reconstruct_data, load_predictor, validate_transfer_preparation,
 )
-from transfer_statistics_test import global_paired_ttest, validate_ndcg_values
+from transfer_statistics_test import (
+    global_paired_ttest, holm_adjust, validate_ndcg_values, welch_transfer_test,
+)
 
 ROOT = Path(__file__).resolve().parent
 # Defaults can be edited here; command-line options and YAML entries override them.
@@ -298,7 +301,373 @@ def transfer_activity_row(source_bin, target_bin, group):
             loss_pct, gain_pct, relative_delta]
 
 
-def report(spec, out):
+def activity_band_statistics(summary, bin_labels):
+    """Compare all planned source/target cells, then Holm-adjust as one family."""
+    rows = []
+    for s, source_range in enumerate(bin_labels['source']):
+        for t, target_range in enumerate(bin_labels['target']):
+            group = summary[(summary.source_bin == s) & (summary.target_bin == t)]
+            result = global_paired_ttest(group.ndcg_dgcdr.to_numpy(),
+                                         group.ndcg_lightgcn.to_numpy())
+            rows.append(dict(
+                source_bin=s, target_bin=t,
+                source_range=source_range, target_range=target_range,
+                ndcg_lightgcn=float(group.ndcg_lightgcn.mean()) if result.n else None,
+                ndcg_dgcdr=float(group.ndcg_dgcdr.mean()) if result.n else None,
+                **asdict(result)))
+    # Keep empty/degenerate cells in the planned family, without inventing
+    # a reported p-value or making the other comparisons less conservative.
+    adjusted = holm_adjust([r['pvalue'] if r['pvalue'] is not None else 1.0
+                            for r in rows])
+    for row, corrected in zip(rows, adjusted):
+        row['pvalue_holm'] = float(corrected) if row['pvalue'] is not None else None
+        if row['reason']:
+            row['outcome'] = 'Non calcolabile'
+        elif row['pvalue_holm'] >= 0.05:
+            row['outcome'] = 'Evidenza insufficiente'
+        elif row['mean_delta'] > 0:
+            row['outcome'] = 'Miglioramento significativo'
+        else:
+            row['outcome'] = 'Peggioramento significativo'
+    return rows
+
+
+def table(headers, rows):
+    return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---']*len(headers)) + '|\n' + ''.join(
+        '| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |\n' for row in rows)
+
+
+def activity_band_heatmap(band_stats, out):
+    """Plot effect size by source (rows) and target (columns), marking Holm significance."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import FuncFormatter
+
+    source_labels = {r['source_bin']: r['source_range'] for r in band_stats}
+    target_labels = {r['target_bin']: r['target_range'] for r in band_stats}
+    n_source, n_target = len(source_labels), len(target_labels)
+    values = [abs(r['mean_delta']) for r in band_stats if r['mean_delta'] is not None]
+    limit = max(values, default=0) or 0.000001
+    norm = Normalize(vmin=-limit, vmax=limit)
+    cmap = LinearSegmentedColormap.from_list('transfer_delta', ['#b96325', '#fbfaf7', '#08618b'])
+    fig = Figure(figsize=(10.8, 6.3), facecolor='white')
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0.03, 0.32, 0.94, 0.61])
+    ax.set_xlim(-1.05, n_target)
+    ax.set_ylim(n_source + 1, 0)
+    ax.set_axis_off()
+    ink, border, header = '#17324d', '#d7e1e7', '#e8eff3'
+
+    def cell(x, y, width, color):
+        ax.add_patch(Rectangle((x, y), width, 1, facecolor=color,
+                               edgecolor=border, linewidth=0.8))
+
+    def label(index, labels, prefix):
+        level = ['Bassa', 'Media', 'Alta'][index] if len(labels) == 3 else 'Fascia ' + str(index)
+        return '%s (%s%d)\n%s' % (level, prefix, index, labels[index])
+
+    cell(-1.05, 0, 1.05, header)
+    ax.text(-0.525, 0.5, 'Source → Target\n(righe)     (colonne)',
+            ha='center', va='center', fontsize=11, fontweight='bold', color=ink)
+    for t in sorted(target_labels):
+        cell(t, 0, 1, header)
+        ax.text(t + 0.5, 0.5, label(t, target_labels, 'T'),
+                ha='center', va='center', fontsize=12, fontweight='bold', color=ink)
+    for s in sorted(source_labels):
+        cell(-1.05, s + 1, 1.05, '#f8fafb')
+        ax.text(-0.95, s + 1.5, label(s, source_labels, 'S'),
+                ha='left', va='center', fontsize=12, color=ink)
+    for row in band_stats:
+        s, t, delta = row['source_bin'], row['target_bin'], row['mean_delta']
+        color = cmap(norm(delta)) if delta is not None else (0.91, 0.93, 0.94, 1)
+        cell(t, s + 1, 1, color)
+        rgb = np.asarray(color[:3])
+        linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        luminance = np.dot(linear, [0.2126, 0.7152, 0.0722])
+        text_color = '#ffffff' if luminance < 0.179 else '#000000'
+        marker = ('†' if row['pvalue_holm'] is None else
+                  '*' if row['pvalue_holm'] < 0.05 else '')
+        value = ('%+.6f' % delta).replace('.', ',').replace('-', '−') if delta is not None else 'n/d'
+        ax.text(t + 0.5, s + 1.4, value + marker, ha='center', va='center',
+                fontsize=16, fontweight='bold', color=text_color)
+        ax.text(t + 0.5, s + 1.72, '(%s utenti)' % f"{row['n']:,}".replace(',', '.'),
+                ha='center', va='center', fontsize=11, color=text_color)
+    fig.text(0.03, 0.965, 'Differenza media NDCG@20 · DGCDR − LightGCN',
+             fontsize=16, fontweight='bold', color=ink)
+    bar_ax = fig.add_axes([0.22, 0.225, 0.72, 0.035])
+    colorbar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=bar_ax,
+                            orientation='horizontal', ticks=np.linspace(-limit, limit, 5))
+    colorbar.outline.set_edgecolor(border)
+    colorbar.ax.tick_params(labelsize=10, length=0, pad=5)
+    colorbar.ax.xaxis.set_major_formatter(FuncFormatter(
+        lambda value, _: ('%.6f' % value).replace('.', ',').replace('-', '−')))
+    fig.text(0.22, 0.14, 'LightGCN migliore', fontsize=12, color=ink)
+    fig.text(0.94, 0.14, 'DGCDR migliore', ha='right', fontsize=12, color=ink)
+    legend = '* p Holm < 0,05; il colore rappresenta il Delta medio.'
+    if any(r['pvalue_holm'] is None for r in band_stats):
+        legend += '   † Test non calcolabile.'
+    fig.text(0.03, 0.075, legend, fontsize=11, color=ink)
+    fig.text(0.03, 0.035, 'Interazioni nel training medie sui seed. Scala simmetrica adattata a questo report.',
+             fontsize=10, color=ink)
+    fig.savefig(out / 'activity_band_heatmap.png', dpi=180)
+
+
+def activity_band_report(summary, bin_labels, out):
+    """Write the band statistics CSV and return the final Markdown section."""
+    lines = []
+    band_stats = activity_band_statistics(summary, bin_labels)
+    activity_band_heatmap(band_stats, out)
+    csv_path = out / 'activity_band_statistics.csv'
+    with csv_path.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(band_stats[0]))
+        writer.writeheader()
+        writer.writerows(band_stats)
+
+    def number(value, fmt='%.6f'):
+        return 'n/d' if value is None else fmt % value
+
+    def pvalue(value):
+        return '< 1e-300' if value == 0 else number(value, '%.2e')
+
+    untestable = [r for r in band_stats if r['reason']]
+    notes = []
+    if untestable:
+        notes.append('**Test non calcolabili:**\n\n' + '\n'.join(
+            '- **S%d × T%d:** %s.' % (r['source_bin'], r['target_bin'], r['reason'])
+            for r in untestable) + '\n')
+
+    lines.extend([
+        '## Significatività del confronto DGCDR–LightGCN per fascia\n',
+        'T-test appaiato bilaterale su NDCG@20: ipotesi nulla di differenza media '
+        'pari a zero. Si usano le medie sui seed per ciascun utente, così ogni '
+        'utente pesa una volta; sono inclusi anche gli utenti con NDCG nullo. '
+        'Le fasce coincidono con quelle della sezione Attività source × target.\n',
+        'La correzione di Holm considera insieme le **%d combinazioni** source × target '
+        'del report (nove quando entrambi i domini hanno tre fasce; le soglie '
+        'coincidenti accorpano le fasce). Anche le combinazioni vuote o con test '
+        'non calcolabile restano nel numero di confronti della correzione. '
+        'Il t-test globale è un confronto distinto e non entra in questa famiglia. '
+        'La decisione usa **p Holm < 0,05**, calcolato prima di arrotondare.\n' % len(band_stats),
+        '**Limiti delle fasce — interazioni train medie sui seed:**\n',
+        table(['Dominio', 'Fascia', 'Interazioni train N'], [
+            [domain.capitalize(), '%s%d' % (prefix, index), label]
+            for domain, prefix in [('source', 'S'), ('target', 'T')]
+            for index, label in enumerate(bin_labels[domain])]),
+        '**Risultati per fascia:** Delta = NDCG medio DGCDR − NDCG medio LightGCN, '
+        'espresso in punti NDCG. Gli esiti riguardano il comportamento medio della '
+        'fascia e non le etichette individuali basate sulla soglia relativa dell’1%.\n',
+        table(['Fascia', 'Utenti', 'NDCG LightGCN', 'NDCG DGCDR', 'Delta medio',
+               'p Holm', 'Esito'], [
+            ['S%d × T%d' % (r['source_bin'], r['target_bin']), r['n'],
+             number(r['ndcg_lightgcn']), number(r['ndcg_dgcdr']), number(r['mean_delta']),
+             pvalue(r['pvalue_holm']), r['outcome']] for r in band_stats]),
+        '![Heatmap del Delta medio NDCG@20 per fascia source × target; '
+        'asterisco per p Holm < 0,05](activity_band_heatmap.png)\n',
+        '**Dettagli statistici:** l’esito finale dipende dal p-value Holm.\n',
+        table(['Fascia', 't', 'p iniziale'], [
+            ['S%d × T%d' % (r['source_bin'], r['target_bin']),
+             number(r['statistic'], '%.4f'), pvalue(r['pvalue'])] for r in band_stats]),
+        *notes,
+        '**Riepilogo:** ' + '; '.join('%s: **%d**' % (
+            outcome, sum(r['outcome'] == outcome for r in band_stats))
+            for outcome in ['Miglioramento significativo', 'Peggioramento significativo',
+                            'Evidenza insufficiente', 'Non calcolabile']) + '.\n',
+        'Evidenza insufficiente non dimostra equivalenza tra i modelli. '
+        'Il confronto riguarda i checkpoint e gli split osservati e assume '
+        'indipendenza tra utenti e un’approssimazione adeguata della distribuzione '
+        'della media. La significatività va letta insieme all’entità del Delta.\n',
+        '[Risultati statistici completi per fascia (CSV)](activity_band_statistics.csv).\n'])
+    return '\n'.join(lines)
+
+
+def source_activity_contrast_report(summary, bin_labels, out):
+    """Write one exploratory S2 vs S0 contrast within T0, without multiplicity adjustment."""
+    low = summary[(summary.source_bin == 0) & (summary.target_bin == 0)]
+    high = summary[(summary.source_bin == 2) & (summary.target_bin == 0)]
+    result = welch_transfer_test(
+        (high.ndcg_dgcdr - high.ndcg_lightgcn).to_numpy(),
+        (low.ndcg_dgcdr - low.ndcg_lightgcn).to_numpy())
+    row = dict(source_low_range=bin_labels['source'][0],
+               source_high_range=bin_labels['source'][2] if len(bin_labels['source']) == 3 else None,
+               target_low_range=bin_labels['target'][0], **asdict(result))
+    if len(bin_labels['source']) != 3 or len(bin_labels['target']) != 3:
+        row['reason'] = 'terzili accorpati: il confronto previsto S2 × T0 vs S0 × T0 non è disponibile'
+    if row['reason']:
+        row['outcome'] = 'Non calcolabile'
+        # Do not expose a test for a different, collapsed binning protocol.
+        row['statistic'] = row['degrees_of_freedom'] = row['pvalue'] = None
+    elif row['pvalue'] >= 0.05:
+        row['outcome'] = 'Evidenza insufficiente'
+    elif row['difference'] > 0:
+        row['outcome'] = 'Vantaggio maggiore con source alto'
+    else:
+        row['outcome'] = 'Vantaggio maggiore con source basso'
+    row.update(pvalue_holm=None, family_size=1, pvalue_adjustment='none',
+               outcome_uncorrected=row['outcome'])
+    with (out / 'source_activity_contrast.csv').open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    return source_activity_contrast_markdown(row)
+
+
+def source_activity_contrast_markdown(row):
+    """Render raw or family-adjusted Welch results, keeping both p-values visible."""
+    corrected = row.get('pvalue_adjustment') == 'holm'
+
+    def number(value, fmt='%.6f'):
+        return 'n/d' if value is None else fmt % value
+
+    pvalue = '< 1e-300' if row['pvalue'] == 0 else number(row['pvalue'], '%.2e')
+    headers = ['D (punti NDCG)', 't Welch', 'p bilaterale non corretto']
+    cells = [number(row['difference']), number(row['statistic'], '%.4f'), pvalue]
+    if corrected:
+        headers.append('p Holm')
+        cells.append('< 1e-300' if row['pvalue_holm'] == 0 else number(row['pvalue_holm'], '%.2e'))
+    headers.append('Esito dopo Holm (5%)' if corrected else 'Esito esplorativo al 5%')
+    cells.append(row['outcome'])
+    lines = [
+        '## Confronto esplorativo: source alto vs basso con target basso\n',
+        '**Research question:** tra gli utenti con bassa attività nel target, '
+        'un’elevata attività nel source è associata a un maggiore vantaggio di '
+        'DGCDR rispetto a LightGCN?\n',
+        'Si confrontano S2 × T0 e S0 × T0 con un **t-test di Welch bilaterale** '
+        'sui Delta individuali (NDCG@20 DGCDR − LightGCN), mediati sui seed. '
+        'Ogni utente pesa una volta, inclusi gli utenti con NDCG nullo per entrambi '
+        'i modelli. I gruppi sono distinti; il test non assume varianze uguali. '
+        'Target basso: **%s** interazioni train medie sui seed.\n' % row['target_low_range'],
+        table(['Gruppo', 'Interazioni source', 'Utenti', 'Delta medio DGCDR − LightGCN'], [
+            ['Source basso (S0 × T0)', row['source_low_range'], row['n_low'], number(row['mean_low'])],
+            ['Source alto (S2 × T0)', row['source_high_range'] or 'n/d', row['n_high'],
+             number(row['mean_high'])]]),
+        '**Differenza D = Delta medio source alto − Delta medio source basso.** '
+        'L’ipotesi nulla è D = 0. D positivo indica un vantaggio relativo maggiore '
+        'con source alto; non implica, da solo, che DGCDR superi LightGCN in valore assoluto.\n',
+        table(headers, [cells]),
+    ]
+    if row['reason']:
+        lines.append('Test non calcolabile: %s.\n' % row['reason'])
+    lines.extend([
+        'L’analisi assume indipendenza fra utenti e riguarda i checkpoint e gli split '
+        'osservati. Descrive un’associazione fra gruppi, non un effetto causale '
+        'dell’aggiunta di dati source. Non verifica se l’effetto sia più forte '
+        'rispetto alla condizione di target alto.\n',
+        '[Risultato completo del confronto Welch (CSV)](source_activity_contrast.csv).\n'])
+    if corrected:
+        lines.append(
+            '**Nota sui confronti multipli:** correzione di **Holm applicata insieme '
+            'ai %d confronti Welch** della famiglia di direzioni analizzate. '
+            'L’esito usa **p Holm < 0,05** prima di arrotondare; il p-value iniziale '
+            'è conservato per confronto. Anche i test non calcolabili restano '
+            'conteggiati nella famiglia. La correzione non cambia medie e differenze '
+            'osservate. Questa famiglia resta distinta dai nove t-test per fascia, '
+            'che hanno la propria correzione di Holm. L’analisi resta esplorativa.\n'
+            % row['family_size'])
+    else:
+        lines.append('**Nota sui confronti multipli:** il p-value di questo confronto esplorativo '
+        'è non corretto. Un unico confronto effettivamente previsto non richiede '
+        'Holm; se vengono definiti più confronti o direzioni, occorre considerarli '
+        'insieme e correggere i p-value della famiglia prevista. I risultati non '
+        'vanno selezionati in base ai p-value. Questa analisi resta distinta dai '
+        'nove t-test per fascia, per i quali la correzione di Holm è già applicata.\n')
+    return '\n'.join(lines)
+
+
+def apply_source_contrast_holm(output_dirs, summary_out):
+    """Correct one explicit family of saved Welch comparisons and update its reports."""
+    outputs = [Path(path).resolve() for path in output_dirs]
+    if not outputs or len(set(outputs)) != len(outputs):
+        raise ValueError('Specificare una famiglia non vuota di cartelle distinte')
+    heading = '## Confronto esplorativo: source alto vs basso con target basso'
+    entries = []
+    for out in outputs:
+        with (out / 'source_activity_contrast.csv').open(encoding='utf-8', newline='') as f:
+            saved_rows = list(csv.DictReader(f))
+        if len(saved_rows) != 1:
+            raise ValueError('Atteso un solo confronto Welch: ' + str(out))
+        row = saved_rows[0]
+        for key in ('n_high', 'n_low'):
+            row[key] = int(row[key])
+        for key in ('mean_high', 'mean_low', 'std_high', 'std_low', 'difference',
+                    'statistic', 'degrees_of_freedom', 'pvalue'):
+            row[key] = float(row[key]) if row[key] else None
+        row['reason'] = row['reason'] or None
+        if row['pvalue'] is None and not row['reason']:
+            raise ValueError('p-value mancante senza motivazione: ' + str(out))
+        original = (out / 'report.md').read_text(encoding='utf-8')
+        if original.count(heading) != 1:
+            raise ValueError('Sezione Welch mancante o duplicata: ' + str(out))
+        spec = json.loads((out / 'config.json').read_text(encoding='utf-8'))['spec']
+        entries.append((out, row, original, spec))
+    adjusted = holm_adjust([r['pvalue'] if not r['reason'] else 1.0
+                            for _, r, _, _ in entries])
+    results = []
+    for (out, row, original, spec), p_holm in zip(entries, adjusted):
+        if row['reason']:
+            raw_outcome = outcome = 'Non calcolabile'
+        else:
+            favored = ('Vantaggio maggiore con source alto' if row['difference'] > 0
+                       else 'Vantaggio maggiore con source basso')
+            raw_outcome = favored if row['pvalue'] < 0.05 else 'Evidenza insufficiente'
+            outcome = favored if p_holm < 0.05 else 'Evidenza insufficiente'
+        row.update(pvalue_holm=float(p_holm) if not row['reason'] else None,
+                   family_size=len(entries), pvalue_adjustment='holm',
+                   outcome_uncorrected=raw_outcome, outcome=outcome)
+        with (out / 'source_activity_contrast.csv').open('w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        prefix = original.split('\n' + heading, 1)[0]
+        (out / 'report.md').write_text(prefix.rstrip() + '\n\n' +
+                                       source_activity_contrast_markdown(row), encoding='utf-8')
+        results.append(dict(direction=out.name, source=spec['source'], target=spec['target'], **row))
+    summary_out = Path(summary_out)
+    summary_out.mkdir(parents=True, exist_ok=True)
+    with (summary_out / 'source_activity_contrast_summary.csv').open(
+            'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(results[0]))
+        writer.writeheader()
+        writer.writerows(results)
+
+    def number(value, fmt='%+.6f'):
+        return 'n/d' if value is None else fmt % value
+
+    outcomes = ['Vantaggio maggiore con source alto', 'Vantaggio maggiore con source basso',
+                'Evidenza insufficiente', 'Non calcolabile']
+    lines = [
+        '# Confronto dell’attività source con target basso — correzione di Holm\n',
+        '**Research question:** tra gli utenti con target basso, un’attività source '
+        'alta è associata a un maggiore vantaggio NDCG@20 di DGCDR rispetto a LightGCN?\n',
+        'Welch bilaterale su S2 × T0 vs S0 × T0, usando i Delta individuali medi '
+        'sui seed. D = Delta source alto − Delta source basso. '
+        '**Holm applicata ai %d confronti**; gli esiti usano p Holm < 0,05. '
+        'La famiglia include tutte le direzioni specificate, senza selezione '
+        'basata sui p-value.\n' % len(entries),
+        table(['Direzione', 'Delta source basso', 'Delta source alto', 'D (punti NDCG)',
+               'p iniziale', 'p Holm', 'Esito dopo Holm'], [
+            [r['direction'].replace('_to_', ' → ').replace('_', ' ').title(),
+             number(r['mean_low']), number(r['mean_high']), number(r['difference']),
+             number(r['pvalue'], '%.3e'), number(r['pvalue_holm'], '%.3e'), r['outcome']]
+            for r in results]),
+        table(['Esito', 'Prima di Holm', 'Dopo Holm'], [
+            [name, sum(r['outcome_uncorrected'] == name for r in results),
+             sum(r['outcome'] == name for r in results)] for name in outcomes]),
+        'Le medie e D non cambiano: Holm corregge la decisione considerando '
+        'l’insieme dei confronti. Evidenza insufficiente non dimostra equivalenza. '
+        'L’analisi resta esplorativa, assume indipendenza fra utenti e riguarda '
+        'i checkpoint e gli split osservati. Descrive associazioni, non causalità.\n',
+        '[Risultati completi e limiti delle fasce (CSV)](source_activity_contrast_summary.csv).\n',
+        '**Nota sui confronti multipli:** questa correzione riguarda i confronti '
+        'Welch tra direzioni; resta distinta dalla correzione dei nove t-test per '
+        'fascia all’interno di ogni report.\n']
+    (summary_out / 'source_activity_contrast_summary.md').write_text('\n'.join(lines), encoding='utf-8')
+    return results
+
+
+def report(spec, out, source_contrast=False):
     import pandas as pd
     df = pd.read_csv(out / 'per_user.csv', dtype={'user_id': str}, encoding='utf-8')
     if df.duplicated(['user_id', 'seed']).any() or not df.groupby('user_id').seed.apply(
@@ -329,16 +698,12 @@ def report(spec, out):
         'include il caso LightGCN = 0 e DGCDR > 0, per il quale la percentuale individuale non è definita.\n'
         '- **Neutral:** variazione relativa strettamente compresa tra −1% e +1%, con LightGCN > 0.\n'
         '- **NDCG@20 nullo:** NDCG@20 pari a zero per entrambi i modelli.\n')
-    def table(headers, rows):
-        return '| ' + ' | '.join(headers) + ' |\n|' + '|'.join(['---']*len(headers)) + '|\n' + ''.join(
-            '| ' + ' | '.join(str(v).replace('|', '\\|') for v in row) + ' |\n' for row in rows)
     test_rows = [['Utenti confrontati', paired_test.n],
                  ['Delta medio (punti NDCG)',
                   '%.6f' % paired_test.mean_delta if paired_test.mean_delta is not None else 'n/d']]
     if paired_test.reason:
         test_rows.extend([['IC 95% del Delta medio', 'n/d'],
                           ['Statistica t', 'n/d'],
-                          ['Gradi di libertà', 'n/d'],
                           ['p-value bilaterale', 'n/d']])
         test_conclusion = 'Test non calcolabile: %s.' % paired_test.reason
     else:
@@ -347,7 +712,6 @@ def report(spec, out):
         test_rows.extend([['IC 95% del Delta medio', '[%.6f, %.6f]' % (
                               paired_test.ci_low, paired_test.ci_high)],
                           ['Statistica t', '%.4f' % paired_test.statistic],
-                          ['Gradi di libertà', paired_test.degrees_of_freedom],
                           ['p-value bilaterale', pvalue_text]])
         if paired_test.pvalue < 0.05:
             winner = 'DGCDR' if paired_test.mean_delta > 0 else 'LightGCN'
@@ -485,6 +849,9 @@ def report(spec, out):
     lines.extend([
         '## Confronto individuale\n[Tutti gli utenti, ordinati per delta e separati per classe](users.md). '
         '[Risultati completi per utente e seed](per_user.csv).\n'])
+    lines.append(activity_band_report(summary, bin_labels, out))
+    if source_contrast:
+        lines.append(source_activity_contrast_report(summary, bin_labels, out))
     (out / 'report.md').write_text('\n'.join(lines), encoding='utf-8')
     user_lines = ['# Confronto utenti test\n[Report generale](report.md)\n',
                   'Metriche medie sui seed; conteggi medi riferiti al training. '
@@ -514,9 +881,18 @@ def main():
     parser.add_argument('--target', help='Override target dataset name from YAML')
     parser.add_argument('--seeds', nargs='+', type=int, default=[2022, 2023, 42, 24, 1])
     parser.add_argument('--stage', choices=['run','report'], default='run')
+    parser.add_argument('--source-contrast', action='store_true',
+                        help='Add an exploratory Welch S2 vs S0 comparison within T0 for this direction')
+    parser.add_argument('--holm-source-contrasts', nargs='+', metavar='OUTPUT_DIR',
+                        help='Apply Holm to the explicit family of saved Welch comparison directories')
+    parser.add_argument('--contrast-summary-dir', default=str(ROOT / 'transfer_results/integrated_analysis'),
+                        help='Destination for the combined Welch/Holm summary')
     args = parser.parse_args()
     # RecBole parses sys.argv itself; keep this entry point's arguments out of it.
     sys.argv = [sys.argv[0]]
+    if args.holm_source_contrasts:
+        apply_source_contrast_holm(args.holm_source_contrasts, args.contrast_summary_dir)
+        return
     spec = yaml.safe_load(Path(args.config).read_text(encoding='utf-8'))
     spec['seeds'] = args.seeds
     if args.source or args.target:
@@ -530,7 +906,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
     if args.stage == 'report':
         saved = json.loads((out/'config.json').read_text(encoding='utf-8'))
-        report(saved['spec'],out)
+        report(saved['spec'], out, source_contrast=args.source_contrast)
         return
     if spec.get('use_gpu', True) and torch.cuda.is_available():
         logging.info('Evaluation device: %s (%s)', torch.device('cuda'), torch.cuda.get_device_name())
@@ -556,7 +932,7 @@ def main():
                                 checkpoints={name: str(paths[(name,seed)]) for name in ('LightGCN','DGCDR')})
     atomic_json(out / 'config.json', dict(spec=spec, seeds=audits))
     write_csv(spec,out,results)
-    report(spec,out)
+    report(spec, out, source_contrast=args.source_contrast)
     logging.info('Report ready: %s',out/'report.md')
 
 
