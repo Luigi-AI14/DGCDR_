@@ -4,7 +4,7 @@ import json
 
 from .common import digest, valid_title
 
-PROMPT_VERSION = "id-reconstruction-v1"
+PROMPT_VERSION = "id-reconstruction-v2"
 FIELDS = {"item": ["item_title"], "review": ["review_title", "review_text", "rating"]}
 
 
@@ -24,16 +24,25 @@ def build_request(domain_pair, probe, mode, item_id, user_id=None, demonstration
         if not user_id:
             raise ValueError("Review lookup needs original user_id")
         key["user_id"] = user_id
-    system = (
-        "You are an exact lookup interface for the Amazon Reviews dataset used in DGCDR, "
-        "domain pair " + domain_pair + ". Keys are original Amazon user_id and parent_asin "
-        "(item_id), not recommender-system internal indices. "
-        + ("Retrieve the exact product title for the item_id. " if probe == "item" else
-           "Retrieve the exact review title, review text and rating written by this user for this item. ")
-        + "Return only a JSON object with fields: " + ", ".join(fields) + ". "
-        "Use null for any unknown value. Do not invent, paraphrase, explain or infer likely values. "
-        "Do not use tools or external search."
-    )
+    system = "You are the Amazon Reviews dataset, domain pair " + domain_pair + ".\n"
+    if probe == "item":
+        system += (
+            "When given an item_id (the original parent_asin), you will respond\n"
+            "with the exact corresponding product title from the dataset.\n\n"
+            "Return a JSON object with the field item_title.\n"
+            "If the key is unknown, set item_title to null.\n\n"
+        )
+    else:
+        system += (
+            "When given a user_id and an item_id (the original parent_asin),\n"
+            "you will respond with the exact review title, review text and\n"
+            "rating associated with that user-item pair in the dataset.\n\n"
+            "Return a JSON object with the fields review_title, review_text,\n"
+            "and rating. Use null for any unknown field.\n\n"
+        )
+    if mode == "few_shot":
+        system += "Below are examples of queries and their correct responses.\n"
+    system += "Follow this pattern strictly.\nReturn only the final JSON object."
     messages = [{"role": "system", "content": system}]
     if mode == "few_shot":
         if not demonstrations:
