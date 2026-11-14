@@ -57,6 +57,7 @@ def channel_measurements(g_target, c_target, s_target, c_source, torch):
     """Match DGCDR.fuse_and_update attention and measure shared cosine."""
     logits = torch.stack(((g_target * c_target).sum(dim=1),
                           (g_target * s_target).sum(dim=1)), dim=1)
+    logits = logits / (g_target.shape[-1] ** 0.5)
     attention = torch.softmax(logits, dim=1)
     source_norm = torch.linalg.vector_norm(c_source, dim=1)
     target_norm = torch.linalg.vector_norm(c_target, dim=1)
