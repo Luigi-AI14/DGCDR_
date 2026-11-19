@@ -10,6 +10,7 @@
 *.json
 *.jsonl
 *.pdf
+*.csv
 scratch_geval_text.txt
 *.pkl
 results
