@@ -228,6 +228,91 @@ python run_llm_explanations.py --model llama3.1:8b
 python run_llm_explanations.py --independent_sampling --seed 42 --num_users 5 --cache_llm --cache_sbert
 ```
 
+## Explanation and review word counts
+
+Run the standalone script (Python standard library only):
+
+```powershell
+python count_explanation_words.py
+# Optional: include the review title as well as its body
+python count_explanation_words.py --include-review-title --output-dir reports/explanation_word_counts_with_titles
+```
+
+It recursively reads `explanations_*.json` in `results_explanations` (override
+with `--results-dir`), ignores Markdown copies and shuffled baselines, and writes
+`reports/explanation_word_counts/word_counts.csv` with one row per explanation.
+Rows include user/item IDs, seed, model, domain, prompt version, generation mode,
+review body/title counts, explanation count, and the source filename.
+`summary.csv` contains total/mean/median/min/max explanation lengths and Pearson
+and Spearman correlations, grouped by domain, model, prompt version and mode.
+`quintile_summary.csv` provides the same statistics, plus sample standard
+deviation, separately for each saved review-length quintile (Q1–Q5) and LLM.
+The console also prints counts and mean/median explanation lengths per quintile.
+Seeds are pooled within each group, while domains and generation modes stay
+separate. Quintile labels, word ranges, original review counts and whether the
+classification included review titles are preserved in `word_counts.csv`.
+Different quintile ranges or title settings form separate quintile summary rows.
+
+Quintiles come from the original reports; they are not recomputed on the selected
+explanations. `--include-review-title` changes the review length used in the
+correlations, not the saved quintile membership. Missing assignments appear as
+`unassigned`, and reviews flagged as ultra-short appear as `excluded`, outside
+Q1–Q5. Pearson/Spearman in `quintile_summary.csv` compare individual review and
+explanation lengths **within** each quintile; compare the group means to see
+how explanation length changes from Q1 to Q5.
+
+For the user-level question "do users who write longer reviews receive longer
+explanations?", enable the NumPy-based user analysis:
+
+```powershell
+python count_explanation_words.py --user-analysis
+```
+
+This adds `user_word_counts.csv`, `user_correlations.csv`,
+`q5_only_comparison.csv`, and a readable `user_analysis.md` in the output folder.
+It averages repeated generations per user/item first, then gives each distinct
+item equal weight within a user and each user equal weight in the analysis.
+Users with incomplete pairs are excluded from inference. Pearson and Spearman
+correlate mean review length with mean explanation length, using 9,999 random
+pairings for two-sided permutation p-values. Q5-only users are users whose **all
+observed held-out items** have saved Q5 assignments; this does not describe their
+entire review history.
+
+The Q5-only comparison reports the overall mean of user means, the Q5-only mean,
+differences in words and percent, and approximate 95% basic bootstrap confidence
+intervals (9,999 resamples of users within each group). A two-sided permutation
+test with a studentized difference in means compares Q5-only users with the
+disjoint group of remaining users. Permutation calibration assumes exchangeability
+under the null; studentization allows asymptotic robustness to unequal variance,
+but small samples remain approximate. The difference versus the overall mean and its interval are scaled by the
+observed proportion of remaining users. Intervals are unadjusted, conditional on
+these group proportions. All available p-values across model/domain/mode groups,
+both correlations, the Q5 comparison, and sensitivity runs receive a single Holm
+multiple-testing correction. A small adjusted p-value indicates evidence of an
+association under the test assumptions, not causation or a large effect.
+
+By default, results include users with at least one review and a sensitivity run
+requiring at least two (`--user-min-reviews 1 2`). Use `--resamples` and
+`--random-seed` to control the permutation tests and bootstrap (defaults: 9999 and 42).
+The inference assumes independent users; shared product characteristics and
+selection effects are not controlled. Some models have different user cohorts,
+so these results are not a matched comparison between LLMs.
+
+Words are whitespace-separated after stripping HTML tags and decoding entities;
+contractions and hyphenated terms count as one word. Review bodies are used by
+default, independently of the reports' existing `review_word_count` field.
+Exact repeated observations with matching run settings, IDs, prompt hash and text
+are counted once; different seeds and different generated texts are retained.
+Empty text counts as zero and is excluded from correlations. Undefined
+correlations (fewer than two pairs or constant lengths) are blank in the CSV.
+
+These comparisons use the **held-out review for the explained item**, not the
+review history supplied to the LLM. Correlations are descriptive: users/items
+can repeat across seeds, and the v3 prompts constrain explanation length to
+25–40 words with a maximum of 49. Item-level summaries make no significance
+claims; the optional user analysis adds the tests described above. Neither
+analysis establishes causation.
+
 ## Acknowledgement
 The implementation is based on the open-source recommendation library [RecBole-CDR](https://github.com/RUCAIBox/RecBole-CDR).
 
